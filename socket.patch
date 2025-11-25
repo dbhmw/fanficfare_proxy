@@ -1,0 +1,11 @@
+--- a/src/socket.py
++++ b/src/socket.py
+@@ -204,7 +204,7 @@
+             return res
+ 
+     async def close(self, code: int = 1000, reason: str = ''):
+-        if self._ws.open:
++        if self._ws.state == websockets.protocol.State.OPEN:
+             try:
+                 await self._ws.close(code=code, reason=reason)
+             except AttributeError as e:

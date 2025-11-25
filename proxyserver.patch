@@ -1,0 +1,11 @@
+--- a/src/proxyserver (1).py
++++ b/src/proxyserver.py
+@@ -209,7 +209,7 @@
+         loader.add_option(
+             "validate_inbound_headers",
+             bool,
+-            True,
++            False,
+             """
+             Make sure that incoming HTTP requests are not malformed.
+             Disabling this option makes mitmproxy vulnerable to HTTP smuggling attacks.
