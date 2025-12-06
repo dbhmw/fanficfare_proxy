@@ -30,22 +30,22 @@ import time
 # used for encoding POST parameters and extracting base website from urls
 import urllib.parse
 
-# used for choosing the random proxy ip
+# used for choosing the random proxy ip, choosing the display
 import random
 
 # only used for debbuging
 import traceback
 
-# Making and checking download dir
+# Making and checking download dir, setting vars in the env for xvfb
 import os
 
 # IDK what to do to get the class deleted
 import weakref, gc#, inspect
 
 class SessionData(TypedDict):
-    DrivenBrowser: weakref.ReferenceType[DrivenBrowser]
     StaleCheck: asyncio.Task[None]
-    _DrivenBrowser: DrivenBrowser # pylint: disable=used-before-assignment
+    DrivenBrowser: DrivenBrowser
+    ProxiedDrivenBrowser: DrivenBrowser # pylint: disable=used-before-assignment
 
 class ServerResponse(TypedDict):
     code: int
@@ -55,12 +55,12 @@ class ServerResponse(TypedDict):
     errors: str
 
 class ServerRequest(TypedDict):
-    method: str
+    method: Literal["GET", "POST"]
     url: str
-    headers: str
+    headers: dict[str,str]
     parameters: str
-    image: str
-    cookies: str
+    image: Literal["True", "False"]
+    cookies: list[RequestCookie]
     session: str
     heartbeat: str
 
@@ -293,6 +293,8 @@ class Init:
             #from cdp_patches.input import AsyncInput
             #self.AsyncInput: AsyncInput = AsyncInput
             logger.info("Using xvfb :%s", str(self.disp.new_display))
+            # Now chrome will not launch in the xvfb without this
+            os.environ["XDG_SESSION_TYPE"] = "x11"
 
         self.set_mitm: bool = (
             self.args.mitm
@@ -553,7 +555,7 @@ class ProxyServer:
 
             try:
                 logger.debug("Client %s: Request for browser enqueued.", request["session"])
-                drivenbrowser_ref = await self.browsercontroller.get_browser(request["session"])
+                drivenbrowser_ref = await self.browsercontroller.get_browser(request["session"], request["image"])
             except Exception as e:
                 logger.error(traceback.format_exc())
                 logger.error("Failed to get browser")
@@ -668,8 +670,28 @@ class ProxyServer:
             raise ValueError("Validation error!")
 
         try:
-            packet_dict: ServerRequest = json.loads(decrypted_packet.decode("utf-8"))
+            packet_l: list[str] = decrypted_packet.decode("utf-8").split("\x01\x7f\x01", 7)
+
+            method = packet_l[0]
+            if method not in ['GET', 'POST']:
+                raise ValueError(f"Invalid method: {method}")
+            image = packet_l[4]
+            if image not in ['True', 'False']:
+                raise ValueError(f"Invalid image value: {image}")
+
+            packet_dict: ServerRequest = {
+                "method": method,
+                "url": packet_l[1],
+                "headers": json.loads(packet_l[2]),
+                "parameters": packet_l[3],
+                "image": image,
+                "cookies": json.loads(packet_l[5]),
+                "session": packet_l[6],
+                "heartbeat": packet_l[7]
+            }
+            logger.debug(packet_dict)
         except Exception as e:
+            logger.warning(traceback.format_exc())
             raise ValueError(f"Corrupted: {str(e)}") from e
 
         return packet_dict
@@ -747,12 +769,15 @@ class ProxyServer:
             logger.debug(e)
 
         async with asyncio.TaskGroup() as tg:
+            logger.debug('server_shutdown_task')
             tg.create_task(self.server_shutdown_task())
 
             for writer, tasks in list(self.active_clients.items()):
+                logger.debug('writer_close_task')
                 tg.create_task(self.writer_close_task(writer=writer))
                 del self.active_clients[writer]
                 if tasks is not None:
+                    logger.debug('client_heartbeat_cancel_task')
                     heartbeat: asyncio.Task[None] = tasks[0]
                     client: asyncio.Task[ServerResponse] = tasks[1]
                     tg.create_task(self.client_heartbeat_cancel_task(heartbeat=heartbeat, client=client))
@@ -762,18 +787,15 @@ class ProxyServer:
                 tg.create_task(self.browsercontroller.shutdown_sessions())
 
 class BrowserController:
-    def __init__(self) -> None:
-        self.config: weakref.ReferenceType[Init]
-        self.sessions: dict[str, SessionData]
-        self.browser_lock: asyncio.Lock
+    def __init__(self, config: weakref.ReferenceType[Init]) -> None:
+        self.config = config
+        self.sessions: dict[str, SessionData] = {}
+        self.browser_lock: asyncio.Lock = asyncio.Lock()
         self.main_driver: webdriver.Chrome
 
     @classmethod
     async def initialize(cls, config: weakref.ReferenceType[Init]) -> BrowserController:
-        instance = cls.__new__(cls)
-        instance.config = config
-        instance.sessions = {}
-        instance.browser_lock = asyncio.Lock()
+        instance = cls(config)
 
         await instance.initialize_main_driver()
 
@@ -824,6 +846,10 @@ class BrowserController:
         # _options.add_argument("--allow-running-insecure-content")
         # _options.add_argument("--allow-mixed-content")
 
+        # if self.config().sock:
+        #     _options.add_argument(self.config().sock)
+        #     _options.add_argument(self.config().sock_2)
+
         if self.config().set_mitm:
             _options.add_argument(f'--ignore-certificate-errors-spki-list={BrowserController.get_certificate_spki_hash(self.config().mitm_cert)}')
 
@@ -837,8 +863,10 @@ class BrowserController:
             _options.add_argument(self.config().sock_2)
 
         self.main_driver = await webdriver.Chrome(max_ws_size=2 ** 30, options=_options)
+        await self.main_driver.set_window_rect(x=0, y=0, width=50, height=50)
+        del _options
 
-    async def get_browser(self, session: str) -> weakref.ReferenceType[DrivenBrowser]:
+    async def get_browser(self, session: str, set_proxy: Literal["True", "False"]) -> weakref.ReferenceType[DrivenBrowser]:
         async with self.browser_lock:
             try:
                 logger.debug(await self.main_driver.title)
@@ -846,38 +874,46 @@ class BrowserController:
                 await self.destroy_main_driver()
                 await self.initialize_main_driver()
 
-            if session in self.sessions:
-                browser = await self._get_driven_browser(session)
-            else:
-                browser = await self._get_new_driven_browser(session)
+            browser_ref: weakref.ReferenceType[DrivenBrowser]
+            if session not in self.sessions:
+                logger.debug("New session %s", session)
 
-        return browser
+                # If the MitM is on, regardless of if the request was modified or not, it is slowing the ao3.
+                drivenbrowser: DrivenBrowser = DrivenBrowser(weakref.ref(self.main_driver), self.config, session, "False")
+                proxieddrivenbrowser: DrivenBrowser = DrivenBrowser(weakref.ref(self.main_driver), self.config, session, "True")
+                await drivenbrowser.get_browser()
+                await proxieddrivenbrowser.get_browser()
+                weakref.finalize(drivenbrowser, lambda: logger.debug("Deleted driver"))
+                weakref.finalize(proxieddrivenbrowser, lambda: logger.debug("Deleted proxied driver"))
 
-    async def _get_new_driven_browser(self, session: str) -> weakref.ReferenceType[DrivenBrowser]:
-        drivenbrowser: DrivenBrowser = DrivenBrowser(weakref.ref(self.main_driver), self.config, session)
-        drivenbrowser_ref: weakref.ReferenceType[DrivenBrowser] = weakref.ref(drivenbrowser)
-        await drivenbrowser.get_browser()
+                drivenbrowser_ref: weakref.ReferenceType[DrivenBrowser] = weakref.ref(drivenbrowser)
+                proxieddrivenbrowser_ref: weakref.ReferenceType[DrivenBrowser] = weakref.ref(proxieddrivenbrowser)
 
-        weakref.finalize(drivenbrowser, lambda: logger.debug("Deleted driver"))
+                task: asyncio.Task[None] = asyncio.create_task(self.browser_auto_destruction(drivenbrowser_ref,proxieddrivenbrowser_ref))
+                task.add_done_callback(self.stale_check_callback)
 
-        task: asyncio.Task[None] = asyncio.create_task(self.browser_auto_destruction(drivenbrowser_ref))
-        task.add_done_callback(self.stale_check_callback)
+                self.sessions[session] = {
+                    'StaleCheck': task,
+                    'DrivenBrowser': drivenbrowser,
+                    'ProxiedDrivenBrowser': proxieddrivenbrowser}
 
-        self.sessions[session] = {
-            'DrivenBrowser': drivenbrowser_ref,
-            'StaleCheck': task,
-            '_DrivenBrowser': drivenbrowser}
+                del drivenbrowser
+                del proxieddrivenbrowser
+                del task
+                if set_proxy == "True":
+                    return proxieddrivenbrowser_ref
+                return drivenbrowser_ref
 
-        return drivenbrowser_ref
-
-    async def _get_driven_browser(self, session: str) -> weakref.ReferenceType[DrivenBrowser]:
         logger.debug("Returning session %s", session)
-        browser_ref: weakref.ReferenceType[DrivenBrowser] = self.sessions[session]['DrivenBrowser']
+        if set_proxy == "True":
+            browser_ref = weakref.ref(self.sessions[session]['ProxiedDrivenBrowser'])
+        else:
+            browser_ref = weakref.ref(self.sessions[session]['DrivenBrowser'])
 
-        if not hasattr(self.sessions[session]['_DrivenBrowser'], 'driver'):
+        if not hasattr(browser_ref(), 'driver'):
             logger.error("No driver present!")
             await self.remove_session(session)
-            return await self._get_new_driven_browser(session)
+            return await self.get_browser(session, set_proxy)
 
         return browser_ref
 
@@ -888,22 +924,51 @@ class BrowserController:
         except asyncio.CancelledError:
             logger.debug("Cancelled %s", session)
 
+        await self.sessions[session]['DrivenBrowser'].terminate_session()
+        await self.sessions[session]['ProxiedDrivenBrowser'].terminate_session()
+
         for f in gc.get_referrers(self.sessions[session]['DrivenBrowser']):
             logger.debug(f)
+        for f in gc.get_referrers(self.sessions[session]['ProxiedDrivenBrowser']):
+            logger.debug(f)
 
+        logger.debug(sys.getrefcount(self.sessions[session]['DrivenBrowser']) - 1)
+        logger.debug(sys.getrefcount(self.sessions[session]['ProxiedDrivenBrowser']) - 1)
+
+        del self.sessions[session]['StaleCheck']
+        del self.sessions[session]['ProxiedDrivenBrowser']
+        del self.sessions[session]['DrivenBrowser']
         del self.sessions[session]
         logger.debug("Destroyed %s", session)
 
-    async def browser_auto_destruction(self, browser: weakref.ReferenceType[DrivenBrowser]) -> None:
+    async def browser_auto_destruction(self, browser: weakref.ReferenceType[DrivenBrowser], proxied_browser: weakref.ReferenceType[DrivenBrowser]) -> None:
         timeout: int = self.config().driver_timeout
+        session: str = browser().session
         while True:
             await asyncio.sleep(5)
-            logger.debug("Checking %s - %s", str(browser().current_id), str(browser().in_use))
-            if not browser().in_use and time.time() - browser().last_used > timeout:
-                await browser().terminate_session()
+
+            browser_obj = browser()
+            proxied_browser_obj = proxied_browser()
+            if browser_obj is None or proxied_browser_obj is None:
+                logger.warning("One or both browsers have been garbage collected.")
                 break
 
-        await self.remove_session(browser().session)
+            logger.debug(
+                "Checking %s - %s | %s - %s",
+                str(browser_obj.current_id),
+                str(browser_obj.in_use),
+                str(proxied_browser_obj.current_id),
+                str(proxied_browser_obj.in_use)
+            )
+
+            current_time = time.time()
+            b_timeout = current_time - browser_obj.last_used > timeout
+            pb_timeout = current_time - proxied_browser_obj.last_used > timeout
+
+            if not browser_obj.in_use and not proxied_browser_obj.in_use and b_timeout and pb_timeout:
+                break
+
+        return await self.remove_session(session)
         # return {k: v for k, v in self.__dict__.items() if not callable(v) and not k.startswith('__')}
 
     def stale_check_callback(self, task: asyncio.Task[None]) -> None:
@@ -916,6 +981,11 @@ class BrowserController:
             logger.warning("AutoDet failed: %s", traceback.format_exc())
 
     async def destroy_main_driver(self) -> None:
+        try:
+            await self.main_driver.close(timeout=3)
+            logger.debug("Closed: %s", str(self.main_driver))
+        except Exception:
+            logger.warning("Driver close returned an error: [%s]", traceback.format_exc())
         try:
             await self.main_driver.quit(timeout=30, clean_dirs=True)
             logger.debug("Stopped: %s", str(self.main_driver))
@@ -931,8 +1001,7 @@ class BrowserController:
     async def _shutdown_session(self, key: str) -> None:
         logger.debug("Force %s", key)
         try:
-            await self.sessions[key]['_DrivenBrowser'].terminate_session()
-            await self.remove_session(self.sessions[key]['_DrivenBrowser'].session)
+            await self.remove_session(self.sessions[key]['DrivenBrowser'].session)
             logger.debug("Stopped driver for: %s", key)
         except asyncio.CancelledError:
             pass
@@ -940,48 +1009,47 @@ class BrowserController:
             logger.warning(traceback.format_exc())
 
 class DrivenBrowser:
-    def __init__(self, chrome: weakref.ReferenceType[webdriver.Chrome], config: weakref.ReferenceType[Init], session: str):
+    def __init__(self, chrome: weakref.ReferenceType[webdriver.Chrome], config: weakref.ReferenceType[Init], session: str, set_proxy: str):
         self.config = config
         self.session = session
         self.chrome = chrome
+        self.set_proxy = set_proxy
 
         self.sessiontabs: dict[int, Target] = {}
         self.current_id: int = random.randint(0, 100)
         self.last_used: float = time.time()
         self.in_use: int = 0
-        # self._input: Optional[AsyncInput] = None
-        self.driver: Context
-        self.downloads_dir: str
+        self.driver: Optional[Context] = None
+        self.downloads_dir: str = "/tmp/downloads_" + str(random.randint(0, 100000)) + set_proxy
 
     async def get_browser(self) -> None:
         if self.current_id < 0:
             return
 
-        proxy: Optional[str] = f"http://127.0.0.1:{self.config().port + 1}" if self.config().set_mitm else None
-        try:
-            self.driver = await self.chrome().new_context(proxy_server=proxy)
-        except TimeoutError as e: # When timing out the chrome remains open. Find a way to close.
-            logger.warning(e)
-            self.driver = await self.chrome().new_context(proxy_server=proxy)
+        chrome = self.chrome()
+        if chrome is None:
+            raise RuntimeError("Chrome deleted")
 
-        # if self.config().sock:
-        #     _options.add_argument(self.config().sock)
-        #     _options.add_argument(self.config().sock_2)
+        proxy: Optional[str] = f"127.0.0.1:{self.config().port + 1}" if self.config().set_mitm else None
+        if proxy and self.set_proxy == "True":
+            logger.debug("Setting MitM proxy")
+            self.driver = await chrome.new_context(proxy_server=proxy)
+        else:
+            self.driver = await chrome.new_context()
+        del chrome
 
         # TO IMPLEMENT
         # Image testing selenium proxy https://archiveofourown.org/works/61648471?view_full_work=true&view_adult=true
-        # Auto download imagesn to this folder. Set the prefs in chrome to down without prompting. And delete the folder when we kill the instance
-        downloads_dir: str = "/tmp/downloads_" + str(random.randint(0, 100000))
-        if not os.path.isdir(downloads_dir):
-            os.mkdir(downloads_dir)
-            logger.debug("Created dir %s", downloads_dir)
-        await self.driver.set_download_behaviour('allowAndName', downloads_dir)
-        self.downloads_dir = downloads_dir
+        if not os.path.isdir(self.downloads_dir):
+            os.mkdir(self.downloads_dir)
+            logger.debug("Created dir %s", self.downloads_dir)
+        await self.driver.set_download_behaviour('allowAndName', self.downloads_dir)
 
         if self.config().virt_disp:
             await self.driver.set_window_rect(x=0,y=0,width=1920,height=1000)
 
         logger.debug("Handed browser for %s", str(self.current_id))
+        return
 
     async def get_tab(self, requestid: int) -> tuple[Target, int]:
         if requestid in self.sessiontabs:
@@ -1023,7 +1091,7 @@ class DrivenBrowser:
         if self.current_id > 0:
             self.current_id = random.randint(0, 1000)
         try:
-            await self.driver.quit(timeout=30)
+            await self.driver.quit(timeout=15)
             logger.debug("Stopped: %s", str(self.driver))
         except Exception:
             logger.warning("Driver quit returned an error: [%s]", traceback.format_exc())
@@ -1223,25 +1291,24 @@ class ClientRequest:
         return False
 
     async def is_captcha(self, tab: Target, code: int) -> bool:
-        if code != 404 and 400 < code < 500:
-            # await tab.execute_cdp_cmd("Fetch.disable")
-            await self.page_loaded(tab)
-            try:
-                checkbox = await tab.find_element(
-                    By.XPATH,
-                    """//input[@type='hidden' and starts-with(@id, 'cf-chl-widget-') and substring(@id, string-length(@id) - string-length('_response') + 1) = '_response']/..""",
-                    timeout=10
-                )
-            except Exception as e:
-                logger.debug("No captcha (%s)", str(e))
-                return False
+        # await tab.execute_cdp_cmd("Fetch.disable")
+        await self.page_loaded(tab)
+        try:
+            checkbox = await tab.find_element(
+                By.XPATH,
+                """//input[@type='hidden' and starts-with(@id, 'cf-chl-widget-') and substring(@id, string-length(@id) - string-length('_response') + 1) = '_response']/..""",
+                timeout=10
+            )
+        except Exception as e:
+            logger.debug("No captcha (%s)", str(e))
+            return False
 
-            if code == 403 or checkbox:
-                if await self.cloudflare_captcha_checked(tab):
-                    logger.debug("Captcha is gone")
-                else:
-                    logger.error('Failed to solve captcha')
-                return True
+        if code == 403 or checkbox:
+            if await self.cloudflare_captcha_checked(tab):
+                logger.debug("Captcha is gone")
+            else:
+                logger.error('Failed to solve captcha')
+            return True
         return False
 
     async def page_loaded(self, tab: Target) -> None:
@@ -1260,7 +1327,7 @@ class ClientRequest:
             logger.debug(await tab.page_source)
             logger.warning("Page failed to load in time")
 
-    async def driverless_post(self, path: str, params: dict[str, str], tab: Target, session: str) -> tuple[int, str, bytes, str]:
+    async def driverless_post(self, path: str, headers: dict[str, str], params: str, tab: Target) -> tuple[int, str, bytes, str]:
         # Tested only on inkbunny & AO3
         logger.debug("POST URL: %s", path)
         #urllib_wantedurl: urllib.parse.SplitResult = urllib.parse.urlsplit(path)
@@ -1268,19 +1335,23 @@ class ClientRequest:
         await tab.get(path, wait_load=True)
 
         await self.page_loaded(tab)
-        encoded_params: str = urllib.parse.urlencode(params)
         raw_response: str = 'None'
         # AO3 does not respond with the elements that indicate that user has logged in.
         await tab.execute_cdp_cmd("Network.clearBrowserCache")
+
+        if "Content-Type" not in headers:
+            headers['Content-Type'] = "application/x-www-form-urlencoded"
+            params_dict: dict[str, str] = json.loads(params)
+            encoded_params: str = urllib.parse.urlencode(params_dict)
+        else:
+            encoded_params = params
+        headers['Referer'] = path
 
         javascript_code = f"""
                 try {{
                     const response = await fetch('{path}', {{
                         method: 'POST',
-                        headers: {{
-                            'Content-Type': 'application/x-www-form-urlencoded',
-                            'Referer': '{path}'
-                        }},
+                        headers: {json.dumps(headers)},
                         body: '{encoded_params}'
                     }});
                     const contentType = response.headers.get('content-type') || 'Unknown';
@@ -1306,6 +1377,7 @@ class ClientRequest:
                     return JSON.stringify(errorResult);
                 }}
         """
+
         raw_response = await tab.eval_async(javascript_code, timeout=self.timeout)
         response: dict[str, str] = json.loads(raw_response)
         status_code: int = int(response["statusCode"])
@@ -1319,31 +1391,25 @@ class ClientRequest:
         logger.info("POST returned: '%s'", response["responseURL"])
         logger.info("POST type: '%s'", content_type)
 
-        # await asyncio.sleep(100)
-
         return (status_code, content_type, source, "None")
 
-    def condition_url(self, url: str, old: str) -> tuple[str, str]:
-        split_url = urllib.parse.urlsplit(url)
-        if not split_url.path.startswith('/'):
-            no_slash = '/'
-        else:
-            no_slash = ''
+    def condition_url(self, url: str, old: str) -> list[str]:
+        split_url = urllib.parse.urlparse(url)
+        split_old = urllib.parse.urlsplit(old)
+        netloc = split_url.netloc or split_old.netloc
 
-        if split_url.netloc:
-            part_url = f"http://{split_url.netloc}{no_slash}{split_url.path}"
-            part_url_2 = f"https://{split_url.netloc}{no_slash}{split_url.path}"
-        else:
-            split_old = urllib.parse.urlsplit(old)
-            part_url = f"http://{split_old.netloc}{no_slash}{split_url.path}"
-            part_url_2 = f"https://{split_old.netloc}{no_slash}{split_url.path}"
+        https_parts = split_url._replace(scheme="https", netloc=netloc)
+        https_url = urllib.parse.urlunparse(https_parts)
+        http_parts = split_url._replace(scheme="http", netloc=netloc)
+        http_url = urllib.parse.urlunparse(http_parts)
 
-        if split_url.query:
-            part_url += f"?{split_url.query}"
-            part_url_2 += f"?{split_url.query}"
+        https_parts = split_url._replace(scheme="https", netloc=netloc, fragment="")
+        https_url_part = urllib.parse.urlunparse(https_parts)
+        http_parts = split_url._replace(scheme="http", netloc=netloc, fragment="")
+        http_url_part = urllib.parse.urlunparse(http_parts)
 
-        logger.debug((part_url_2, part_url))
-        return (part_url_2, part_url)
+        logger.debug((https_url, http_url))
+        return [https_url, http_url, https_url_part, http_url_part]
 
     async def correct_image_content(self, url: str, status_code: int, content_type: str, source: bytes) -> str:
         # Dropbox just starts a download and returns application/binary content type but the picture is still in the req
@@ -1411,7 +1477,7 @@ class ClientRequest:
             del req
 
         async def request_paused_handler(params: ChromeResponse) -> None:
-            if params['request']['url'] in [https_link, http_link]:
+            if params['request']['url'] in links:
                 await request_queue.put(params)
             else:
                 # Continue requests we don't care about
@@ -1432,16 +1498,17 @@ class ClientRequest:
                     await asyncio.sleep(0.1)  # Sleep to avoid busy waiting
 
         while True:
-            https_link, http_link = self.condition_url(url, old)
+            links = self.condition_url(url, old)
             await tab.execute_cdp_cmd("Fetch.enable", cmd_args={"patterns": [{'urlPattern': '*', 'requestStage': 'Request'}]})
             await tab.add_cdp_listener("Fetch.requestPaused", request_paused_handler)
             if image == "True" and self.intercept().ready:
-                intercept_name = session + https_link
-                await self.intercept().set_standard_rules(intercept_name, [https_link, http_link])
+                intercept_name = session + links[0]
+                await self.intercept().set_standard_rules(intercept_name, links)
 
             try:
-                logger.debug("URL: %s | Referer: %s", https_link, str(referer))
-                req = asyncio.create_task(tab.get(https_link, referrer=referer, wait_load=False, timeout=self.timeout))
+                logger.debug("URL: %s | Referer: %s", links[0], str(referer))
+                req = asyncio.create_task(tab.get(links[0], referrer=referer, wait_load=False, timeout=self.timeout))
+                status_code = -10
                 # For the infinite redirection https://archiveofourown.org/works/38595468
                 hit: int = 0
                 async for params in request_generator():
@@ -1454,7 +1521,7 @@ class ClientRequest:
                         if not status_code in [301, 302, 303, 307, 308]:
                             body: dict[str, str] = await tab.execute_cdp_cmd("Fetch.getResponseBody", continue_cmd, timeout=self.timeout)
                             source = base64.b64decode(body['body'])
-                        if hit > 3:
+                        if hit > 7:
                             fail_cmd = {"requestId": params['requestId']}
                             fail_cmd["errorReason"] = 'AddressUnreachable'
                             await tab.execute_cdp_cmd("Fetch.failRequest", fail_cmd)
@@ -1502,20 +1569,20 @@ class ClientRequest:
                 if image == "True" and self.intercept().ready:
                     await self.intercept().remove_rule(intercept_name)
 
-            logger.info("Page returned: '%s'", str(status_code))
-
             if response_error_reason:
                 raise ImageError(f"Could not get a response ({response_error_reason})", (-1, "None", b"None", f"Could not get a response ({response_error_reason})"))
 
             # Will this ever be reached?
-            if not status_code or not response_headers:
+            if status_code == -10 or not response_headers:
                 if not self.img_workaround:
-                    raise ImageError("Did not get headers", (-1, "None", source, "Did not get headers"))
+                    raise ImageError("Did not get headers", (-1, "None", b"None", "Did not get headers"))
                 status_code = -1
-                return (status_code, "None", source, f"Could not get a full response ({headers})")
+                return (status_code, "None", b"None", f"Could not get a full response ({headers})")
+
+            logger.info("Page returned: '%s'", str(status_code))
 
             if status_code in [301, 302, 303, 307, 308]:
-                old = https_link
+                old = links[0]
                 for header in response_headers:
                     if header['name'].lower() == 'location':
                         url = header['value']
@@ -1542,25 +1609,22 @@ class ClientRequest:
 
     async def main(self, request: ServerRequest) -> ServerResponse:
         result: tuple[int, str, bytes, str] = (-1, "None", b"None", "Failed to get a page.")
-        # tab, drivenbrowser_id = cast(tuple[Target, int], await self.drivenbrowser().get_tab(self.requestid))
         tab, drivenbrowser_id = await self.drivenbrowser().get_tab(self.requestid)
 
-        headers: dict[str, str] = json.loads(request["headers"])
-        parameters: dict[str, str] = json.loads(request["parameters"])
-        cookies: list[RequestCookie] = json.loads(request['cookies'])
-
-        if cookies:
+        if request["cookies"]:
             logger.debug("We got extra cookies")
-            await asyncio.gather(*(tab.add_cookie(cookie) for cookie in cookies))
+            await asyncio.gather(*(tab.add_cookie(cookie) for cookie in request["cookies"]))
 
         for attempt in range(0, 5):
             logger.info("Attempt %s for %s", str(attempt), request['session'])
 
             try:
                 if request["method"] == "GET":
-                    result = await asyncio.wait_for(self.driverless_get(tab=tab, url=request["url"], image=request["image"], headers=headers, session=request['session']), timeout=self.timeout*1.2)
+                    result = await asyncio.wait_for(self.driverless_get(tab=tab, url=request["url"], headers=request["headers"], image=request["image"], session=request['session']),
+                                                    timeout=self.timeout*1.2)
                 elif request["method"] == "POST":
-                    result = await asyncio.wait_for(self.driverless_post(path=request["url"], params=parameters, tab=tab, session=request['session']), timeout=self.timeout*1.2)
+                    result = await asyncio.wait_for(self.driverless_post(tab=tab, path=request["url"], headers=request["headers"], params=request["parameters"]),
+                                                    timeout=self.timeout*1.2)
                 else:
                     logger.error("Not supported HTTP method: %s", request["method"])
                     return {"code": -1, "content_type": "None", "source": "RmFpbGVk", "cookies": "None", "errors": "Not supported HTTP method"}
@@ -1577,7 +1641,7 @@ class ClientRequest:
                 continue
             except RefererError:
                 self.img_workaround = True
-                headers.pop('Referer', None)
+                request["headers"].pop('Referer', None)
                 continue
             except OutdatedUrlError as e:
                 request["url"] = str(e)
@@ -1588,8 +1652,15 @@ class ClientRequest:
                 tab, drivenbrowser_id = await self.drivenbrowser().get_tab(self.requestid)
                 continue
 
-            if await self.is_captcha(tab, result[0]):
-                continue
+            if result[0] != 404 and 400 < result[0] < 500:
+                page_title = await tab.title
+                if 'used Cloudflare to restrict hotlinking' in page_title:
+                    logger.debug(page_title)
+                    request['headers']['Referer'] = request['url']
+                    continue
+
+                if await self.is_captcha(tab, result[0]):
+                    continue
             break
         else:
             logger.warning("Failed to get the content. Sending as is!")
