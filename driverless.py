@@ -897,6 +897,9 @@ class BrowserController:
                     'DrivenBrowser': drivenbrowser,
                     'ProxiedDrivenBrowser': proxieddrivenbrowser}
 
+                del drivenbrowser
+                del proxieddrivenbrowser
+                del task
                 if set_proxy == "True":
                     return proxieddrivenbrowser_ref
                 return drivenbrowser_ref
@@ -929,6 +932,12 @@ class BrowserController:
         for f in gc.get_referrers(self.sessions[session]['ProxiedDrivenBrowser']):
             logger.debug(f)
 
+        logger.debug(sys.getrefcount(self.sessions[session]['DrivenBrowser']) - 1)
+        logger.debug(sys.getrefcount(self.sessions[session]['ProxiedDrivenBrowser']) - 1)
+
+        del self.sessions[session]['StaleCheck']
+        del self.sessions[session]['ProxiedDrivenBrowser']
+        del self.sessions[session]['DrivenBrowser']
         del self.sessions[session]
         logger.debug("Destroyed %s", session)
 
@@ -1031,7 +1040,6 @@ class DrivenBrowser:
 
         # TO IMPLEMENT
         # Image testing selenium proxy https://archiveofourown.org/works/61648471?view_full_work=true&view_adult=true
-        # Auto download imagesn to this folder. Set the prefs in chrome to down without prompting. And delete the folder when we kill the instance
         if not os.path.isdir(self.downloads_dir):
             os.mkdir(self.downloads_dir)
             logger.debug("Created dir %s", self.downloads_dir)
@@ -1041,6 +1049,7 @@ class DrivenBrowser:
             await self.driver.set_window_rect(x=0,y=0,width=1920,height=1000)
 
         logger.debug("Handed browser for %s", str(self.current_id))
+        return
 
     async def get_tab(self, requestid: int) -> tuple[Target, int]:
         if requestid in self.sessiontabs:
