@@ -1,5 +1,5 @@
---- a/src/socket.py
-+++ b/src/socket.py
+--- a/cdp_socket/socket.py
++++ b/cdp_socket/socket.py
 @@ -204,7 +204,7 @@
              return res
  

@@ -1,5 +1,5 @@
---- a/src/selenium_driverless/webdriver.py
-+++ b/src/selenium_driverless/webdriver.py
+--- a/selenium_driverless/webdriver.py
++++ b/selenium_driverless/webdriver.py
 @@ -121,6 +121,7 @@ def __init__(
          self._is_remote = False
          self._has_incognito_contexts: bool = False

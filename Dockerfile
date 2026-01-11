@@ -55,6 +55,7 @@ COPY --chown=fff_proxy:fff_proxy --chmod=770 socket.patch .
 COPY --chown=fff_proxy:fff_proxy --chmod=770 webdriver.patch .
 COPY --chown=fff_proxy:fff_proxy --chmod=770 proxyserver.patch .
 COPY --chown=fff_proxy:fff_proxy --chmod=770 target.patch .
+COPY --chown=fff_proxy:fff_proxy --chmod=770 context.patch .
 
 # Download and install ungoogled-chromium
 ADD --chown=fff_proxy:fff_proxy --chmod=770 https://github.com/ungoogled-software/ungoogled-chromium-portablelinux/releases/download/142.0.7444.59-1/ungoogled-chromium-142.0.7444.59-1-x86_64_linux.tar.xz /tmp/chromium.tar.xz
@@ -73,9 +74,10 @@ RUN sed -i 's/\r$//' "/home/fff_proxy/.venv/lib/python3.13/site-packages/seleniu
 RUN patch "/home/fff_proxy/.venv/lib/python3.13/site-packages/selenium_driverless/webdriver.py" webdriver.patch
 RUN sed -i 's/\r$//' "/home/fff_proxy/.venv/lib/python3.13/site-packages/selenium_driverless/types/target.py"
 RUN patch "/home/fff_proxy/.venv/lib/python3.13/site-packages/selenium_driverless/types/target.py" target.patch
+RUN sed -i 's/\r$//' "/home/fff_proxy/.venv/lib/python3.13/site-packages/selenium_driverless/types/context.py"
+RUN patch "/home/fff_proxy/.venv/lib/python3.13/site-packages/selenium_driverless/types/context.py" context.patch
 RUN sed -i 's/\r$//' "/home/fff_proxy/.venv/lib/python3.13/site-packages/mitmproxy/addons/proxyserver.py"
 RUN patch "/home/fff_proxy/.venv/lib/python3.13/site-packages/mitmproxy/addons/proxyserver.py" proxyserver.patch
-
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1

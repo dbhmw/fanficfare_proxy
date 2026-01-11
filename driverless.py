@@ -1,11 +1,12 @@
 from __future__ import annotations
-from typing import Optional, Union, Literal, TypedDict, NamedTuple, TextIO, NoReturn, AsyncGenerator
-import asyncio, zlib
-import argparse, configparser, sys, signal, logging
-import ssl, base64, hashlib, json, re
+from typing import Optional, Literal, Any, TypedDict, NamedTuple, TextIO, AsyncGenerator
+import asyncio, zlib, argparse, configparser, sys, signal, logging
+import ssl, base64, hashlib, json, re, threading
+import weakref, gc, types#, inspect
 from xvfbwrapper import Xvfb
 from asyncio.sslproto import SSLProtocol
 from asyncio import StreamReader, StreamWriter, StreamReaderProtocol
+from functools import partial
 
 from selenium_driverless import webdriver
 from selenium_driverless.types.by import By
@@ -39,13 +40,13 @@ import traceback
 # Making and checking download dir, setting vars in the env for xvfb
 import os
 
-# IDK what to do to get the class deleted
-import weakref, gc#, inspect
+#import pdb
+#        pdb.set_trace()
+# gc.set_debug(gc.DEBUG_SAVEALL)
 
 class SessionData(TypedDict):
     StaleCheck: asyncio.Task[None]
     DrivenBrowser: DrivenBrowser
-    ProxiedDrivenBrowser: DrivenBrowser # pylint: disable=used-before-assignment
 
 class ServerResponse(TypedDict):
     code: int
@@ -143,9 +144,6 @@ class RefererError(Exception):
 class OutdatedUrlError(Exception):
     def __init__(self, message: str) -> None:
         super().__init__(message)
-
-class MitmProxyExitError(Exception):
-    """Custom exception for mitmproxy exit attempts"""
 
 class ColoredFormatter(logging.Formatter):
     RESET: str = "\033[0m"
@@ -352,7 +350,7 @@ class Init:
 
     def prepserver(self) -> None:
         self.loop = asyncio.new_event_loop()
-        self.loop.set_debug(True)
+        self.loop.set_debug(False)
         asyncio.set_event_loop(self.loop)
 
         self.statistics = Stats()
@@ -389,11 +387,20 @@ class Init:
         except Exception:
             logger.error(traceback.format_exc())
 
+        tasks_to_await: list[asyncio.Task[None]] = [
+            t
+            for t in asyncio.all_tasks(self.loop)
+            if t.get_name() == "remove_session"
+        ]
+
+        resuts = await asyncio.gather(*tasks_to_await, return_exceptions=True)
+        logger.debug(resuts)
+
         logger.debug("Cancelling remaining tasks.")
         tasks_to_cancel: list[asyncio.Task[None]] = [
             t
             for t in asyncio.all_tasks(self.loop)
-            if t.get_name() == "BrowserWorker" or t.get_name() == "Server" or t.get_name() == "ServerTask" or t.get_name() == "mitm_task"
+            if t.get_name() == "BrowserWorker" or t.get_name() == "Server" or t.get_name() == "ServerTask"
         ]
 
         for task in tasks_to_cancel:
@@ -433,7 +440,7 @@ class Init:
         logger.debug("Terminated")
         if self.in_progress:
             logger.info('Received CNTR+C, exiting...')
-            sys.exit(10)
+            sys.exit(1)
 
         self.in_progress = True
         shutdown_task: asyncio.Task[None] = self.loop.create_task(self.graceful_shutdown())
@@ -444,8 +451,8 @@ class Init:
             logger.info("Shutdown complete.")
             try:
                 future.result()
-            except asyncio.CancelledError as e:
-                logger.error("Cancelled: %s", str(e))
+            except asyncio.CancelledError:
+                logger.debug("Cancelled")
             except Exception as e:
                 logger.error("On exit: %s", str(e))
             self.loop.stop()
@@ -455,15 +462,14 @@ class Init:
 class ProxyServer:
     def __init__(self, init: Init) -> None:
         self.server: asyncio.base_events.Server
+        self.browsercontroller: BrowserController
         self.server_task: asyncio.Task[None]
 
         self.init: Init = init
         self.rules: InterceptRuleManager = InterceptRuleManager()
         self.stats: Stats = self.init.statistics
-        self.browsercontroller: BrowserController
-
-        self.active_clients: dict[StreamWriter, tuple[asyncio.Task[None], asyncio.Task[ServerResponse]]] = {}
         self.mitm: Optional[DumpMaster] = None
+        self.connections: dict[bytes,asyncio.Task[None]] = {}
 
     async def run_server(self, loop: asyncio.AbstractEventLoop) -> None:
         try:
@@ -477,13 +483,27 @@ class ProxyServer:
             )
             context.load_verify_locations(cafile=self.init.clientcert)
 
+            def connection(reader: StreamReader, writer: StreamWriter):
+                client = loop.create_task(self.handle_client(reader, writer))
+                client_id = os.urandom(32)
+                self.connections[client_id] = client
+                def handle_result(task):
+                    del self.connections[client_id]
+                    try:
+                        result = task.result()
+                        logger.debug(f"Client {result}")
+                    except asyncio.CancelledError:
+                        logger.debug("Cancelled")
+                    except Exception as e:
+                        logger.error(f"Error handling client: {e}")
+                client.add_done_callback(handle_result)
+
             def protocol_factory() -> BlowUpSSLProtocol:
                 # For each new connection, build a StreamReader + protocol
                 reader: StreamReader = StreamReader()
                 sr_protocol: StreamReaderProtocol = StreamReaderProtocol(
                     reader,
-                    client_connected_cb = lambda r, w: asyncio.create_task(self.handle_client(r, w))
-                )
+                    client_connected_cb = connection)
 
                 waiter: asyncio.Future[None] = loop.create_future()
                 proto = BlowUpSSLProtocol(loop, sr_protocol, context, waiter=waiter, server_side=True)
@@ -498,9 +518,10 @@ class ProxyServer:
                 waiter.add_done_callback(log_handshake_result)
                 return proto
 
-            mitm_task = asyncio.create_task(self.run_mitm(), name="mitm_task")
+            if self.init.set_mitm:
+                self.mitm_thread = threading.Thread(target=self.run_mitm, daemon=True)
+                self.mitm_thread.start()
 
-            # Create and serve
             self.server = await loop.create_server(
                 protocol_factory=protocol_factory,
                 host=self.init.host,
@@ -513,62 +534,64 @@ class ProxyServer:
 
         logger.info("Serving FFF proxy on %s", self.server.sockets[0].getsockname())
 
+        asyncio.set_event_loop(loop)
         self.server_task = asyncio.create_task(self.server.serve_forever(), name="ServerTask")
+        await self.server_task
 
-        await asyncio.gather(self.server_task, mitm_task)
+    def run_mitm(self) -> None:
+        self.mitm_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.mitm_loop)
 
-    async def run_mitm(self) -> None:
-        if not self.init.set_mitm:
-            return
-        original_exit = sys.exit
+        async def mitm_start():
+            try:
+                listen_port: int = self.init.port+1
+                logger.info("Serving MitM proxy on ('127.0.0.1', %s)",str(listen_port))
+                # ssl_insecure=True for website https://i.im.ge/*
+                # Patch to disable validate_inbound_headers is for website https://complexkari.files.wordpress.com/*
+                opts = options.Options(listen_host="127.0.0.1",listen_port=listen_port,ssl_insecure=True)
+                self.mitm = DumpMaster(opts, with_termlog=False,with_dumper=False,loop=self.mitm_loop)
+                self.mitm.addons.add(MitmAddOn(self.rules))
+                self.rules.ready = True
+                await self.mitm.run()
+            except SystemExit as e:
+                logger.error("MitM proxy failed to start or run: %s", e)
+            except Exception as e:
+                logger.error(f"MitM proxy error: {e}")
+            finally:
+                self.rules.ready = False
 
         try:
-            def patched_exit(code: Optional[Union[int, str]] = None) -> NoReturn:
-                if code is None:
-                    code = 0
-                raise MitmProxyExitError(f"mitmproxy attempted to exit with code {code}")
-
-            sys.exit = patched_exit
-
-            listen_port: int = self.init.port+1
-            logger.info("Serving MitM proxy on ('127.0.0.1', %s)",str(listen_port))
-            # ssl_insecure=True for website https://i.im.ge/*
-            # Patch to disable validate_inbound_headers is for website https://complexkari.files.wordpress.com/*
-            opts = options.Options(listen_host="127.0.0.1",listen_port=listen_port,ssl_insecure=True)
-            self.mitm = DumpMaster(opts, with_termlog=False,with_dumper=False)
-            self.mitm.addons.add(MitmAddOn(self.rules))
-            self.rules.ready = True
-
-            await self.mitm.run()
-        except MitmProxyExitError as e:
-            logger.error("MitM proxy failed to start or run: %s", e)
+            self.mitm_loop.run_until_complete(mitm_start())
+        except Exception as e:
+            logger.error(f"Error in MitM thread: {traceback.format_exc()}")
         finally:
-            sys.exit = original_exit
-            self.rules.ready = False
+            self.mitm_loop.close()
 
     async def handle_client(self, reader: StreamReader, writer: StreamWriter) -> None:
         content: ServerResponse = {"code": -1, "content_type": "None", "source": "RmFpbGVk", "cookies": "None", "errors": "Failed to process a client."}
         client: Optional[ClientRequest] = None
+        client_task: Optional[asyncio.Task[ServerResponse]] = None
+        heartbeat: Optional[asyncio.Task[None]] = None
+
+        packet: bytes = await self.receive_request(reader)
+        request: ServerRequest = await self.decrypt(packet)
+
         try:
-            packet: bytes = await self.receive_request(reader)
-            request: ServerRequest = await self.decrypt(packet)
+            logger.debug("Client %s: Request for browser enqueued.", request["session"])
+            drivenbrowser_ref = await self.browsercontroller.get_session_browser(request["session"], request["image"])
+        except Exception as e:
+            logger.error(traceback.format_exc())
+            logger.error("Failed to get browser")
+            await self.send_response(writer, await self.encrypt(response=content))
+            raise e
 
-            try:
-                logger.debug("Client %s: Request for browser enqueued.", request["session"])
-                drivenbrowser_ref = await self.browsercontroller.get_browser(request["session"], request["image"])
-            except Exception as e:
-                logger.error(traceback.format_exc())
-                logger.error("Failed to get browser")
-                await self.send_response(writer, await self.encrypt(response=content))
-                raise e
-
-            heartbeat: asyncio.Task[None] = asyncio.create_task(self.heartbeat(writer, request["heartbeat"]))
+        try:
+            heartbeat = asyncio.create_task(self.heartbeat(writer, request["heartbeat"]))
             try:
                 client = ClientRequest(weakref.ref(self.stats), drivenbrowser_ref, weakref.ref(self.rules))
                 weakref.finalize(client, lambda: logger.debug("Deleted client"))
-                client_task: asyncio.Task[ServerResponse] = asyncio.create_task(client.main(request))
+                client_task = asyncio.create_task(client.main(request))
                 drivenbrowser_ref().in_use += 1
-                self.active_clients[writer] = (heartbeat, client_task)
                 content = await client_task
             except Exception as e:
                 self.stats.add_failed(request["url"], str(e))
@@ -587,13 +610,7 @@ class ProxyServer:
                 logger.warning("Failed to fetch %s", request["url"])
                 self.stats.add_failed(request["url"], content["errors"])
 
-            try:
-                heartbeat.cancel()
-                await heartbeat
-            except asyncio.CancelledError:
-                logger.debug("Heartbeat was cancelled.")
-
-            del self.active_clients[writer]
+            await self._cancel_task(heartbeat)
 
             response = await self.encrypt(response=content)
             await self.send_response(writer, response)
@@ -610,12 +627,13 @@ class ProxyServer:
             logger.error("Unexpected error in handle_client: %s", traceback.format_exc())
             raise e
         finally:
+            logger.debug("Finalizing client")
             async with asyncio.TaskGroup() as tg:
-                tasks = self.active_clients.get(writer)
-                if tasks is not None:
-                    del self.active_clients[writer]
-                    tg.create_task(self.client_heartbeat_cancel_task(heartbeat=heartbeat, client=client_task))
                 tg.create_task(self.writer_close_task(writer))
+                if heartbeat:
+                    tg.create_task(self._cancel_task(heartbeat))
+                if client_task:
+                    tg.create_task(self._cancel_task(client_task))
 
     async def heartbeat(self, writer: StreamWriter, beat: str) -> None:
         while True:
@@ -672,12 +690,13 @@ class ProxyServer:
         try:
             packet_l: list[str] = decrypted_packet.decode("utf-8").split("\x01\x7f\x01", 7)
 
-            method = packet_l[0]
-            if method not in ['GET', 'POST']:
-                raise ValueError(f"Invalid method: {method}")
-            image = packet_l[4]
-            if image not in ['True', 'False']:
-                raise ValueError(f"Invalid image value: {image}")
+            if packet_l[0] not in ['GET', 'POST']:
+                raise ValueError(f"Invalid method: {packet_l[0]}")
+            method: Literal['GET', 'POST'] = packet_l[0]
+
+            if packet_l[4] not in ['True', 'False']:
+                raise ValueError(f"Invalid image value: {packet_l[4]}")
+            image: Literal['True', 'False'] = packet_l[4]
 
             packet_dict: ServerRequest = {
                 "method": method,
@@ -689,7 +708,6 @@ class ProxyServer:
                 "session": packet_l[6],
                 "heartbeat": packet_l[7]
             }
-            logger.debug(packet_dict)
         except Exception as e:
             logger.warning(traceback.format_exc())
             raise ValueError(f"Corrupted: {str(e)}") from e
@@ -733,17 +751,12 @@ class ProxyServer:
         except Exception as e:
             logger.warning("Unexpected exception [%s]", str(e))
 
-    async def client_heartbeat_cancel_task(self, heartbeat: asyncio.Task[None], client: asyncio.Task[ServerResponse]) -> None:
+    async def _cancel_task(self, task: asyncio.Task[Any]) -> None:
         try:
-            heartbeat.cancel()
-            await heartbeat
+            task.cancel()
+            await task
         except asyncio.CancelledError:
-            logger.debug("Heartbeat was cancelled. 2")
-        try:
-            client.cancel()
-            await client
-        except asyncio.CancelledError:
-            logger.debug("Client was cancelled. 2")
+            logger.debug(f"{task} was cancelled.")
         except Exception as e:
             logger.warning(e)
 
@@ -760,31 +773,46 @@ class ProxyServer:
         except asyncio.CancelledError:
             logger.debug("Server serve_forever() task cancelled.")
 
+    async def mitm_shutdown(self) -> None:
+        if not self.mitm_loop.is_closed():
+            self.mitm_loop.call_soon_threadsafe(self.mitm.should_exit.set)
+            await asyncio.sleep(0.01) # Without the delay stuff crashes
+
+        if not self.mitm_loop.is_closed():
+            try:
+                self.mitm_loop.call_soon_threadsafe(self.mitm_loop.stop)
+            except Exception as e:
+                logger.warning(f"Error during loop stop: {traceback.format_exc()}")
+
+        if self.mitm_thread:
+            self.mitm_thread.join(timeout=15)
+            if self.mitm_thread.is_alive():
+                logger.warning("Thread didn't stop after 15s")
+
+        if not self.mitm_loop.is_closed():
+            try:
+                self.mitm_loop.close()
+            except Exception as e:
+                logger.warning(f"Error closing loop: {e}")
+        return None
+
     async def shutdown(self) -> None:
         try:
             if self.mitm:
-                self.mitm.shutdown()
+                await self.mitm_shutdown()
                 logger.debug('Shutdown mitm')
         except Exception as e:
-            logger.debug(e)
+            logger.warning(e)
 
         async with asyncio.TaskGroup() as tg:
-            logger.debug('server_shutdown_task')
+            for conn in self.connections.values():
+                tg.create_task(self._cancel_task(conn))
+
             tg.create_task(self.server_shutdown_task())
 
-            for writer, tasks in list(self.active_clients.items()):
-                logger.debug('writer_close_task')
-                tg.create_task(self.writer_close_task(writer=writer))
-                del self.active_clients[writer]
-                if tasks is not None:
-                    logger.debug('client_heartbeat_cancel_task')
-                    heartbeat: asyncio.Task[None] = tasks[0]
-                    client: asyncio.Task[ServerResponse] = tasks[1]
-                    tg.create_task(self.client_heartbeat_cancel_task(heartbeat=heartbeat, client=client))
-
             if hasattr(self, 'browsercontroller'):
-                logger.debug('browsercontroller shutdown')
                 tg.create_task(self.browsercontroller.shutdown_sessions())
+                logger.debug('browsercontroller shutdown')
 
 class BrowserController:
     def __init__(self, config: weakref.ReferenceType[Init]) -> None:
@@ -796,9 +824,7 @@ class BrowserController:
     @classmethod
     async def initialize(cls, config: weakref.ReferenceType[Init]) -> BrowserController:
         instance = cls(config)
-
         await instance.initialize_main_driver()
-
         return instance
 
     @staticmethod
@@ -821,10 +847,13 @@ class BrowserController:
 
         return base64_hash
 
-    async def initialize_main_driver(self) -> webdriver.Chrome:
+    async def initialize_main_driver(self) -> None:
+        config = self.config()
+        if config is None:
+            raise RuntimeError
         _options: Options = webdriver.ChromeOptions()
-        if self.config().chormium:
-            _options.binary_location = self.config().chormium
+        if config.chormium:
+            _options.binary_location = config.chormium
         _options.add_argument("--no-sandbox")
         _options.add_argument("--disable-setuid-sandbox")
         # _options.add_argument("--no-service-autorun")
@@ -850,135 +879,21 @@ class BrowserController:
         #     _options.add_argument(self.config().sock)
         #     _options.add_argument(self.config().sock_2)
 
-        if self.config().set_mitm:
+        if config.set_mitm:
             _options.add_argument(f'--ignore-certificate-errors-spki-list={BrowserController.get_certificate_spki_hash(self.config().mitm_cert)}')
 
-        if self.config().adblock:
-            logger.debug(self.config().adblock)
-            _options.add_extension(self.config().adblock)
-        if self.config().extension:
-            _options.add_extension(self.config().extension)
-        if self.config().sock:
-            _options.add_argument(self.config().sock)
-            _options.add_argument(self.config().sock_2)
-
+        if config.adblock:
+            logger.debug(config.adblock)
+            _options.add_extension(config.adblock)
+        if config.extension:
+            _options.add_extension(config.extension)
+        if config.sock and config.sock_2:
+            _options.add_argument(config.sock)
+            _options.add_argument(config.sock_2)
+        del config
         self.main_driver = await webdriver.Chrome(max_ws_size=2 ** 30, options=_options)
         await self.main_driver.set_window_rect(x=0, y=0, width=50, height=50)
         del _options
-
-    async def get_browser(self, session: str, set_proxy: Literal["True", "False"]) -> weakref.ReferenceType[DrivenBrowser]:
-        async with self.browser_lock:
-            try:
-                logger.debug(await self.main_driver.title)
-            except ConnectionClosedError:
-                await self.destroy_main_driver()
-                await self.initialize_main_driver()
-
-            browser_ref: weakref.ReferenceType[DrivenBrowser]
-            if session not in self.sessions:
-                logger.debug("New session %s", session)
-
-                # If the MitM is on, regardless of if the request was modified or not, it is slowing the ao3.
-                drivenbrowser: DrivenBrowser = DrivenBrowser(weakref.ref(self.main_driver), self.config, session, "False")
-                proxieddrivenbrowser: DrivenBrowser = DrivenBrowser(weakref.ref(self.main_driver), self.config, session, "True")
-                await drivenbrowser.get_browser()
-                await proxieddrivenbrowser.get_browser()
-                weakref.finalize(drivenbrowser, lambda: logger.debug("Deleted driver"))
-                weakref.finalize(proxieddrivenbrowser, lambda: logger.debug("Deleted proxied driver"))
-
-                drivenbrowser_ref: weakref.ReferenceType[DrivenBrowser] = weakref.ref(drivenbrowser)
-                proxieddrivenbrowser_ref: weakref.ReferenceType[DrivenBrowser] = weakref.ref(proxieddrivenbrowser)
-
-                task: asyncio.Task[None] = asyncio.create_task(self.browser_auto_destruction(drivenbrowser_ref,proxieddrivenbrowser_ref))
-                task.add_done_callback(self.stale_check_callback)
-
-                self.sessions[session] = {
-                    'StaleCheck': task,
-                    'DrivenBrowser': drivenbrowser,
-                    'ProxiedDrivenBrowser': proxieddrivenbrowser}
-
-                del drivenbrowser
-                del proxieddrivenbrowser
-                del task
-                if set_proxy == "True":
-                    return proxieddrivenbrowser_ref
-                return drivenbrowser_ref
-
-        logger.debug("Returning session %s", session)
-        if set_proxy == "True":
-            browser_ref = weakref.ref(self.sessions[session]['ProxiedDrivenBrowser'])
-        else:
-            browser_ref = weakref.ref(self.sessions[session]['DrivenBrowser'])
-
-        if not hasattr(browser_ref(), 'driver'):
-            logger.error("No driver present!")
-            await self.remove_session(session)
-            return await self.get_browser(session, set_proxy)
-
-        return browser_ref
-
-    async def remove_session(self, session: str) -> None:
-        try:
-            self.sessions[session]['StaleCheck'].cancel()
-            await self.sessions[session]['StaleCheck']
-        except asyncio.CancelledError:
-            logger.debug("Cancelled %s", session)
-
-        await self.sessions[session]['DrivenBrowser'].terminate_session()
-        await self.sessions[session]['ProxiedDrivenBrowser'].terminate_session()
-
-        for f in gc.get_referrers(self.sessions[session]['DrivenBrowser']):
-            logger.debug(f)
-        for f in gc.get_referrers(self.sessions[session]['ProxiedDrivenBrowser']):
-            logger.debug(f)
-
-        logger.debug(sys.getrefcount(self.sessions[session]['DrivenBrowser']) - 1)
-        logger.debug(sys.getrefcount(self.sessions[session]['ProxiedDrivenBrowser']) - 1)
-
-        del self.sessions[session]['StaleCheck']
-        del self.sessions[session]['ProxiedDrivenBrowser']
-        del self.sessions[session]['DrivenBrowser']
-        del self.sessions[session]
-        logger.debug("Destroyed %s", session)
-
-    async def browser_auto_destruction(self, browser: weakref.ReferenceType[DrivenBrowser], proxied_browser: weakref.ReferenceType[DrivenBrowser]) -> None:
-        timeout: int = self.config().driver_timeout
-        session: str = browser().session
-        while True:
-            await asyncio.sleep(5)
-
-            browser_obj = browser()
-            proxied_browser_obj = proxied_browser()
-            if browser_obj is None or proxied_browser_obj is None:
-                logger.warning("One or both browsers have been garbage collected.")
-                break
-
-            logger.debug(
-                "Checking %s - %s | %s - %s",
-                str(browser_obj.current_id),
-                str(browser_obj.in_use),
-                str(proxied_browser_obj.current_id),
-                str(proxied_browser_obj.in_use)
-            )
-
-            current_time = time.time()
-            b_timeout = current_time - browser_obj.last_used > timeout
-            pb_timeout = current_time - proxied_browser_obj.last_used > timeout
-
-            if not browser_obj.in_use and not proxied_browser_obj.in_use and b_timeout and pb_timeout:
-                break
-
-        return await self.remove_session(session)
-        # return {k: v for k, v in self.__dict__.items() if not callable(v) and not k.startswith('__')}
-
-    def stale_check_callback(self, task: asyncio.Task[None]) -> None:
-        try:
-            result = task.result()
-            logger.debug("AutoDet completed: %s", str(result))
-        except asyncio.CancelledError:
-            logger.debug("AutoDet cancelled")
-        except Exception:
-            logger.warning("AutoDet failed: %s", traceback.format_exc())
 
     async def destroy_main_driver(self) -> None:
         try:
@@ -990,7 +905,109 @@ class BrowserController:
             await self.main_driver.quit(timeout=30, clean_dirs=True)
             logger.debug("Stopped: %s", str(self.main_driver))
         except Exception:
-            logger.warning("Driver quit returned an error: [%s]", traceback.format_exc())
+            logger.warning("Driver quit returned an error: [%s]", str(e))
+
+    async def get_session_browser(self, session: str, set_proxy: Literal["True", "False"]) -> weakref.ReferenceType[DrivenBrowser]:
+        async with self.browser_lock:
+            try:
+                logger.debug(await self.main_driver.title)
+            except ConnectionClosedError:
+                await self.destroy_main_driver()
+                await self.initialize_main_driver()
+
+            if session in self.sessions:
+                logger.debug(f"Returning session {session} {set_proxy}")
+                browser_ref: weakref.ReferenceType[DrivenBrowser] = weakref.ref(self.sessions[session]['DrivenBrowser'])
+
+                return browser_ref
+
+            logger.debug(f"New session {session} {set_proxy}")
+
+            # If the MitM is on, regardless of if the request was modified or not, it is slowing the ao3.
+            drivenbrowser: DrivenBrowser = DrivenBrowser(weakref.ref(self.main_driver), self.config, session, set_proxy)
+            weakref.finalize(drivenbrowser, lambda: logger.debug("Deleted driver"))
+            _ = await drivenbrowser.get_browser()
+
+            drivenbrowser_ref: weakref.ReferenceType[DrivenBrowser] = weakref.ref(drivenbrowser)
+
+            task: asyncio.Task[None] = asyncio.create_task(self.browser_auto_destruction(drivenbrowser_ref))
+            task.add_done_callback(partial(self.stale_check_callback, session=session))
+
+            self.sessions[session] = {
+                'StaleCheck': task,
+                'DrivenBrowser': drivenbrowser}
+            del drivenbrowser, task
+
+            return drivenbrowser_ref
+
+    async def browser_auto_destruction(self, browser: weakref.ReferenceType[DrivenBrowser]) -> None:
+        timeout: int = self.config().driver_timeout
+        while True:
+            await asyncio.sleep(5)
+
+            if browser() is None:
+                logger.warning("Browser have been garbage collected.")
+                break
+
+            logger.debug(
+                "Checking %s - %s",
+                str(browser().current_id),
+                str(browser().in_use),
+            )
+
+            current_time = time.time()
+            b_timeout = current_time - browser().last_used > timeout
+
+            if not browser().in_use and b_timeout:
+                break
+
+        return None
+        # return {k: v for k, v in self.__dict__.items() if not callable(v) and not k.startswith('__')}
+
+    def stale_check_callback(self, task: asyncio.Task[None], session: str) -> None:
+        try:
+            result = task.result()
+            logger.debug("AutoDet completed: %s", str(result))
+        except asyncio.CancelledError:
+            logger.debug("AutoDet cancelled")
+        except Exception:
+            logger.warning("AutoDet failed: %s", traceback.format_exc())
+
+        removal_task = asyncio.get_running_loop().create_task(
+            self.remove_session(session),
+            name="remove_session"
+        )
+        removal_task.add_done_callback(lambda t: logger.debug(f"remove_session {session} completed"))
+
+    async def remove_session(self, session: str) -> None:
+        try:
+            self.sessions[session]['StaleCheck'].cancel()
+            await self.sessions[session]['StaleCheck']
+        except asyncio.CancelledError:
+            logger.debug("Cancelled %s", session)
+        try:
+            _ = self.sessions[session]['StaleCheck'].result()
+        except Exception as e:
+            logger.debug(e)
+        except asyncio.CancelledError:
+            logger.debug("CancelledError")
+
+        try:
+            await self.sessions[session]['DrivenBrowser'].terminate_session()
+        except Exception as e:
+            logger.warning(f"Failed to execute terminate_session {str(e)}")
+
+        # I gave up, AI generated frame cleanup and debug
+        if sys.getrefcount(self.sessions[session]['DrivenBrowser']) > 2:
+            cleared = await self._destroy_orphaned_frames_holding_object(self.sessions[session]['DrivenBrowser'], module_filter="driverless.py")
+            logger.debug(cleared)
+        del self.sessions[session]['StaleCheck']
+        del self.sessions[session]['DrivenBrowser']
+        del self.sessions[session]
+
+        logger.debug("Destroyed %s", session)
+
+        return None
 
     async def shutdown_sessions(self) -> None:
         tasks: list[asyncio.Task[None]] = [asyncio.create_task(self._shutdown_session(key))
@@ -998,67 +1015,131 @@ class BrowserController:
         await asyncio.gather(*tasks)
         await self.destroy_main_driver()
 
-    async def _shutdown_session(self, key: str) -> None:
-        logger.debug("Force %s", key)
+    async def _shutdown_session(self, session: str) -> None:
+        logger.debug("Force %s", session)
         try:
-            await self.remove_session(self.sessions[key]['DrivenBrowser'].session)
-            logger.debug("Stopped driver for: %s", key)
+            self.sessions[session]['StaleCheck'].cancel()
+            logger.debug("Stopped driver for: %s", session)
         except asyncio.CancelledError:
             pass
-        except Exception:
-            logger.warning(traceback.format_exc())
+        except Exception as e:
+            logger.warning("Unable to shutdown", exc_info=e)
+
+    async def _destroy_orphaned_frames_holding_object(self, obj: Any, module_filter: str | None = None) -> int:
+        """
+        Forcefully destroy orphaned frames holding references to obj.
+        This directly manipulates frame internals.
+        """
+        obj_id = id(obj)
+        destroyed = 0
+
+        # Active frames to skip
+        active_frames: set[types.FrameType] = set()
+
+        for task in asyncio.all_tasks():
+            coro = getattr(task, "_coro", None)
+            while coro:
+                frame = getattr(coro, "cr_frame", None)
+                if frame is not None:
+                    active_frames.add(frame)
+                coro = getattr(coro, "cr_await", None)
+
+        # Only iterate objects that reference our target
+        for frame_obj in gc.get_referrers(obj):
+            if not isinstance(frame_obj, types.FrameType):
+                continue
+
+            if module_filter and module_filter not in frame_obj.f_code.co_filename:
+                continue
+            if frame_obj in active_frames:
+                continue
+
+            try:
+                for var_name, var_value in frame_obj.f_locals.items():
+                    if id(var_value) == obj_id:
+                        logger.debug("Clearing orphaned frame %s:%s var=%s",
+                                frame_obj.f_code.co_name, frame_obj.f_lineno, var_name)
+                        frame_obj.f_locals[var_name] = None
+                        destroyed += 1
+                        break
+            except Exception as e:
+                logger.debug(f"Error nuking frame: {e}")
+
+        return destroyed
 
 class DrivenBrowser:
-    def __init__(self, chrome: weakref.ReferenceType[webdriver.Chrome], config: weakref.ReferenceType[Init], session: str, set_proxy: str):
-        self.config = config
-        self.session = session
+    def __init__(self, chrome: weakref.ReferenceType[webdriver.Chrome], config: weakref.ReferenceType[Init], session: str, set_proxy: Literal['True', 'False']):
         self.chrome = chrome
+        self.session = session
         self.set_proxy = set_proxy
-
         self.sessiontabs: dict[int, Target] = {}
+        self.drivers: dict[str, Optional[Context]] = {
+                "True": None, 
+                "False": None
+            }
         self.current_id: int = random.randint(0, 100)
         self.last_used: float = time.time()
         self.in_use: int = 0
-        self.driver: Optional[Context] = None
-        self.downloads_dir: str = "/tmp/downloads_" + str(random.randint(0, 100000)) + set_proxy
+        self.downloads_dir: str = f"/tmp/downloads_{str(random.randint(0, 100000))}"
 
-    async def get_browser(self) -> None:
-        if self.current_id < 0:
-            return
+        conf = config()
+        if conf is None:
+            raise RuntimeError("Config deleted")
+        self.set_mitm: bool = conf.set_mitm
+        self.virt_disp: bool = conf.virt_disp
+        self.port: int = conf.port
+        del conf
+
+    async def get_browser(self) -> Context:
+        context = self.drivers[self.set_proxy]
+        if context:
+            return context
 
         chrome = self.chrome()
         if chrome is None:
             raise RuntimeError("Chrome deleted")
 
-        proxy: Optional[str] = f"127.0.0.1:{self.config().port + 1}" if self.config().set_mitm else None
-        if proxy and self.set_proxy == "True":
-            logger.debug("Setting MitM proxy")
-            self.driver = await chrome.new_context(proxy_server=proxy)
+        if self.set_proxy == "True":
+            started_context = await self.start_proxied_browser(chrome)
         else:
-            self.driver = await chrome.new_context()
+            started_context = await self.start_unproxied_browser(chrome)
         del chrome
 
-        # TO IMPLEMENT
         # Image testing selenium proxy https://archiveofourown.org/works/61648471?view_full_work=true&view_adult=true
         if not os.path.isdir(self.downloads_dir):
             os.mkdir(self.downloads_dir)
             logger.debug("Created dir %s", self.downloads_dir)
-        await self.driver.set_download_behaviour('allowAndName', self.downloads_dir)
+        await started_context.set_download_behaviour('allowAndName', self.downloads_dir)
 
-        if self.config().virt_disp:
-            await self.driver.set_window_rect(x=0,y=0,width=1920,height=1000)
+        if self.virt_disp:
+            await started_context.set_window_rect(x=0,y=0,width=1920,height=1080)
 
-        logger.debug("Handed browser for %s", str(self.current_id))
-        return
+        logger.debug(f"Handed browser for {self.current_id}")
+        return started_context
+
+    async def start_unproxied_browser(self, chrome: webdriver.Chrome) -> Context:
+        unproxied: Context = await chrome.new_context()
+        self.drivers['False'] = unproxied
+        return unproxied
+
+    async def start_proxied_browser(self, chrome: webdriver.Chrome) -> Context:
+        if not self.set_mitm:
+            logger.warning("Proxy not avalible")
+            return await self.start_unproxied_browser(chrome)
+        proxy: str = f"127.0.0.1:{self.port + 1}"
+        logging.debug(f"Setting proxy {proxy}")
+        proxied: Context = await chrome.new_context(proxy_server=proxy)
+        self.drivers['True'] = proxied
+        return proxied
 
     async def get_tab(self, requestid: int) -> tuple[Target, int]:
         if requestid in self.sessiontabs:
             return self.sessiontabs[requestid], self.current_id
         if self.current_id < 0:
-            logger.debug("Shutdown?")
             raise RuntimeError("Shutdown?")
+
         try:
-            tab: Target = await self.driver.new_window(type_hint="tab", url="about:blank", activate=False)
+            tab: Target = await (await self.get_browser()).new_window(type_hint="tab", url="about:blank", activate=False)
         except (ConnectionClosedError, TimeoutError):
             await self.broken_browser(self.current_id)
             return await self.get_tab(requestid)
@@ -1071,18 +1152,17 @@ class DrivenBrowser:
             return
         cookies: Optional[list[dict[str, str]]] = None
         try:
-            cookies = await self.driver.get_cookies()
+            cookies = await (await self.get_browser()).get_cookies()
             logger.debug(cookies)
         except Exception:
             logger.warning('Dead browser')
 
         await self.destroy_driver(self.current_id)
-        await self.get_browser()
 
         if cookies:
             for cookie in cookies:
                 logger.debug(cookie)
-                await self.driver.add_cookie(cookie)
+                await (await self.get_browser()).add_cookie(cookie)
 
     async def destroy_driver(self, current_id: int) -> None:
         if current_id != self.current_id:
@@ -1090,15 +1170,27 @@ class DrivenBrowser:
             return
         if self.current_id > 0:
             self.current_id = random.randint(0, 1000)
+
+        self.sessiontabs.clear()
         try:
-            await self.driver.quit(timeout=15)
-            logger.debug("Stopped: %s", str(self.driver))
-        except Exception:
-            logger.warning("Driver quit returned an error: [%s]", traceback.format_exc())
-        if hasattr(self, "driver"):
-            del self.driver
-        self.sessiontabs = {}
-        await self.clear_downloads(delete_folder=True)
+            await self.clear_downloads(delete_folder=True)
+        except Exception as e:
+            logger.warning("Unable to clear downloads: [%s]", exc_info=e)
+
+        for context in self.drivers.values():
+            if context is None:
+                continue
+            for target in await context.window_handles:
+                try:
+                    tab = await target.Target
+                    logger.debug(str(tab))
+                    await tab.close()
+                except Exception as e:
+                    logger.warning("Closing tab returned an error: %s", str(e))
+            # await self.driver.quit(timeout=15) Raises CDP exception Not Allowed
+            logger.debug("Stopped: %s", str(context))
+
+        self.drivers = {"True": None,"False": None}
 
     async def destroy_tab(self, requestid: int) -> None:
         try:
@@ -1110,20 +1202,7 @@ class DrivenBrowser:
             else:
                 logger.debug("Requestid not found. Chrome was destroyed?")
         except Exception:
-            logger.warning(traceback.format_exc())
-
-    async def click(self, tab: Target, x: int = 0, y: int = 0) -> None:#, mouse_button: Optional[Literal["left", "right", "middle"]] = "left") -> None:
-        is_int: bool = isinstance(x, int)
-        #if not self._input or not mouse_button or not is_int:
-        logger.debug("Click with Pointer")
-        if is_int:
-            await tab.pointer.click(x_or_elem=x, y=y)
-        else:
-            await tab.pointer.click(x_or_elem=x)
-        # else:
-        #     logger.debug("Click with Async")
-        #     # Offset by 50 as AsyncInput misses by that.
-        #     await self._input.click(mouse_button, x, (y - 50))
+            logger.warning("Unable to close the tab", exc_info=e)
 
     async def clear_downloads(self, delete_folder: bool = False) -> None:
         if os.path.exists(self.downloads_dir) and os.path.isdir(self.downloads_dir):
@@ -1141,8 +1220,11 @@ class DrivenBrowser:
 
     async def terminate_session(self) -> None:
         self.current_id = -1
-        self.sessiontabs = {}
         await self.destroy_driver(-1)
+        self.drivers.clear()
+        del self.drivers
+        logger.debug("Terminated session")
+        return None
 
 class ClientRequest:
     def __init__(self, stats: weakref.ReferenceType[Stats], drivenbrowser: weakref.ReferenceType[DrivenBrowser], intercept: weakref.ReferenceType[InterceptRuleManager]) -> None:
@@ -1181,17 +1263,19 @@ class ClientRequest:
                 logger.debug(e)
                 continue
             try:
-                shadow_document: WebElement = await container.shadow_root
+                shadow_document: Optional[WebElement] = await container.shadow_root
+                logger.debug(shadow_document)
+                if not shadow_document:
+                    raise NoSuchElementException()
                 iframe: WebElement = await shadow_document.find_element(By.CSS_SELECTOR, "iframe", timeout=3)
-                # logger.debug("iframe: %s" % iframe)
                 content_document: WebElement = await asyncio.wait_for(iframe.content_document, timeout=10)
-                # logger.debug("content_document: %s" % content_document)
-                # await asyncio.sleep(0.3)
                 body: WebElement = await content_document.find_element(By.XPATH, "//body", timeout=4)
-                nested_shadow_document: WebElement = await body.shadow_root
+                nested_shadow_document: Optional[WebElement] = await body.shadow_root
+                if not nested_shadow_document:
+                    raise NoSuchElementException()
                 checkbox: WebElement = await nested_shadow_document.find_element(By.CSS_SELECTOR, "input[type='checkbox']", timeout=10)
             except Exception as e:
-                logger.warning("Failed to locate the emenets in time: [%s]", str(e))
+                logger.warning("Failed to locate the emenets: [%s]", str(e))
                 break
 
             try:
@@ -1212,7 +1296,7 @@ class ClientRequest:
                 #await asyncio.sleep(0.5)
                 #await tab.get_screenshot_as_file('/home/r/Downloads/png1.png')
 
-                await self.drivenbrowser().click(tab=tab, x=x, y=y)
+                await tab.pointer.click(x_or_elem=x, y=y)
 
                 for _ in range(8):
                     # await tab.get_screenshot_as_file('/home/r/Downloads/png2.png')
@@ -1223,7 +1307,7 @@ class ClientRequest:
                     await asyncio.sleep(0.5)
 
                 if current_text in ("Verifying...", "Verify you are human"):
-                    await self.drivenbrowser().click(tab=tab, x=x, y=y)
+                    await tab.pointer.click(x_or_elem=x, y=y)
                     await asyncio.sleep(0.3)
                     # await tab.get_screenshot_as_file('/home/r/Downloads/png3.png')
                     logger.error('Failed to click captcha')
@@ -1312,15 +1396,20 @@ class ClientRequest:
         return False
 
     async def page_loaded(self, tab: Target) -> None:
+        state = None
         try:
-            s = 0
+            await tab.wait_for_cdp("Page.domContentEventFired", timeout=30)
+        except TimeoutError:
+            logger.warning("Timeout!")
+        try:
             state = await tab.eval_async("return document.readyState")
             logger.debug(state)
-            while state != "complete" and s < 100:
-                s += 1
+            for x in range(100):
+                if state == "complete":
+                    break
                 state = await tab.eval_async("return document.readyState")
                 await asyncio.sleep(0.2)
-                logger.debug((state, s))
+                logger.debug((state, x))
         except TimeoutError:
             logger.warning("Timeout!")
         if state != "complete":
@@ -1455,26 +1544,27 @@ class ClientRequest:
     async def driverless_get(self, tab: Target, url: str, image: str, headers: dict[str, str], session: str) -> tuple[int, str, bytes, str]:
         response_headers: Optional[list[ChromeResponseHeaders]] = None
         response_error_reason: Optional[str] = None
+        intercept_name: Optional[str] = None
         request_queue: asyncio.Queue[ChromeResponse] = asyncio.Queue()
         referer: Optional[str] = headers.get('Referer')
         old: str = url
         error: str = "None"
-        status_code: int
-        source: bytes
+        status_code: int = -10
+        source: bytes = b"Failed"
 
         if self.img_workaround:
             # Sometimes there is a need to reload or wait for a page to load. Sometimes it triggers a download.
             # 'https://i.gifer.com/embedded/download/4oCW.gif'
             logger.debug("WORKAROUND URL: %s | Referer: %s", url, str(referer))
-            req = await tab.get(url, referrer=referer, wait_load=True, timeout=self.timeout)
-            if file := req.get('guid_file'):
-                logger.debug("Reqeust result: %s", req)
+            pg: dict = await tab.get(url, referrer=referer, wait_load=True, timeout=self.timeout)
+            if file := pg.get('guid_file'):
+                logger.debug("Reqeust result: %s", pg)
                 with open(file, "rb") as file:
                     source = file.read()
                 # Previous missed request left a file that we have no record of.
                 await self.drivenbrowser().clear_downloads()
                 return (200, "image/file", source, "File")
-            del req
+            del pg
 
         async def request_paused_handler(params: ChromeResponse) -> None:
             if params['request']['url'] in links:
@@ -1507,8 +1597,7 @@ class ClientRequest:
 
             try:
                 logger.debug("URL: %s | Referer: %s", links[0], str(referer))
-                req = asyncio.create_task(tab.get(links[0], referrer=referer, wait_load=False, timeout=self.timeout))
-                status_code = -10
+                req: asyncio.Task[dict] = asyncio.create_task(tab.get(links[0], referrer=referer, wait_load=False, timeout=self.timeout))
                 # For the infinite redirection https://archiveofourown.org/works/38595468
                 hit: int = 0
                 async for params in request_generator():
@@ -1526,7 +1615,6 @@ class ClientRequest:
                             fail_cmd["errorReason"] = 'AddressUnreachable'
                             await tab.execute_cdp_cmd("Fetch.failRequest", fail_cmd)
                             status_code = 500
-                            source = b"Failed"
                             error = "Too Many Redirects"
                             break
 
@@ -1546,13 +1634,15 @@ class ClientRequest:
                                     "name": 'Priority',
                                     "value": 'u=5, i'
                             }]
-                            if self.intercept().ready:
+                            if intercept_name:
                                 logger.debug("Appending 'Y-Session-ID': '%s'", intercept_name)
                                 continue_cmd["headers"].append({"name": 'Y-Session-ID', "value": intercept_name})
                     await tab.execute_cdp_cmd("Fetch.continueRequest", continue_cmd)
 
+                if status_code == 200:
+                    await tab.execute_cdp_cmd("Page.stopLoading")
                 result = await req
-                logger.debug("Reqeust result: %s", result)
+                logger.debug(f"Reqeust result: {result}")
             except CDPError as e:
                 if not (e.code == -32602 and e.message == 'Invalid InterceptionId.'):
                     raise e
@@ -1566,7 +1656,7 @@ class ClientRequest:
                     await tab.remove_cdp_listener("Fetch.requestPaused", request_paused_handler)
                 except ValueError:
                     pass
-                if image == "True" and self.intercept().ready:
+                if intercept_name:
                     await self.intercept().remove_rule(intercept_name)
 
             if response_error_reason:
@@ -1682,6 +1772,7 @@ class ClientRequest:
 # Set up logging
 logger: logging.Logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
+logger.propagate = False
 # Create console handler
 ch: logging.StreamHandler[TextIO] = logging.StreamHandler()
 ch.setLevel(logging.DEBUG)
