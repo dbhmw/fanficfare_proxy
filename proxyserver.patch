@@ -1,5 +1,5 @@
---- a/src/proxyserver (1).py
-+++ b/src/proxyserver.py
+--- a/mitmproxy/addons/proxyserver.py
++++ b/mitmproxy/addons/proxyserver.py
 @@ -209,7 +209,7 @@
          loader.add_option(
              "validate_inbound_headers",

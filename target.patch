@@ -1,5 +1,5 @@
---- src/a/target.py
-+++ src/b/target.py
+--- a/selenium_driverless/types/target.py
++++ b/selenium_driverless/types/target.py
 @@ -833,7 +833,7 @@
          context_id = None
          # noinspection PyProtectedMember
