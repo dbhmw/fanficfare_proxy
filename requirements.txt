@@ -1,5 +1,6 @@
 selenium-driverless @ https://github.com/kaliiiiiiiiii/Selenium-Driverless/archive/refs/heads/dev.zip
-cdp_patches
 xvfbwrapper
-mitmproxy
 cryptography
+h2
+uvloop
+brotli

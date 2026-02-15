@@ -1,2 +1,4 @@
 Certs/
 .mypy_cache/
+global_cookies
+__pycache__/
