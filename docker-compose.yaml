@@ -3,7 +3,9 @@ services:
     image: fff_proxy:latest
     build: .
     ports:
-      - "23002:23000"
+      - "23000:23000"
     volumes:
       - ./Certs:/home/fff_proxy/certs:ro
     restart: on-failure
+    tmpfs:
+      - /tmp:rw,size=1g,mode=1777

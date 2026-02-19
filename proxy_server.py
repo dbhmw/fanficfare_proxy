@@ -12,6 +12,7 @@ import threading
 import time
 import traceback
 import zlib
+from utls_bridge.sidecar import SidecarManager
 from asyncio import StreamReader, StreamWriter
 from dataclasses import dataclass, field
 from enum import Enum
@@ -1568,18 +1569,44 @@ class _ProxyHandler:
         target_tls: Optional[ManagedConnection] = None
 
         try:
+            # ── Step 1: Send "200" and pause reading ──
+            # The browser won't send its ClientHello until it receives
+            # the "200". By pausing reading immediately after, we ensure
+            # the ClientHello stays in the kernel socket buffer (not the
+            # StreamReader) during the target connection phase.
             client.writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             await client.writer.drain()
+            client.writer.transport.pause_reading()
 
-            protocol, client_tls = await self._negotiate_client_tls(client, host)
+            # ── Step 2: Connect to target, learn its protocol ──
+            # This takes 1-5 seconds. During this time the browser
+            # receives "200" and sends its ClientHello, which accumulates
+            # in the kernel buffer (safe — not in StreamReader).
+            if self._proxy.sidecar:
+                target_tls, target_protocol = await self._connect_via_sidecar(host, port)
+                self._proxy._track_connection(target_tls)
+            else:
+                target = await self._connect_to_target(host, port)
+                self._proxy._track_connection(target)
+
+                target_tls, target_protocol = await self._negotiate_target_tls(target, host)
+                self._proxy._track_connection(target_tls)
+
+            # ── Step 3: Browser MITM TLS with matching protocol ──
+            # Offer only what the target supports. start_tls() internally
+            # resumes reading through the SSL layer, which picks up the
+            # ClientHello from the kernel buffer. Handshake succeeds.
+            if target_protocol == Protocol.HTTP2:
+                browser_alpn = ("h2", "http/1.1")
+            else:
+                browser_alpn = ("http/1.1",)
+
+            protocol, client_tls = await self._negotiate_client_tls(
+                client, host, alpn=browser_alpn
+            )
             self._proxy._track_connection(client_tls)
 
-            target = await self._connect_to_target(host, port)
-            self._proxy._track_connection(target)
-
-            target_tls = await self._negotiate_target_tls(target, host, protocol)
-            self._proxy._track_connection(target_tls)
-
+            # ── Step 4: Proxy traffic ──
             if protocol == Protocol.HTTP2:
                 await self.http2.start_session(client_tls, target_tls, host)
             else:
@@ -1597,13 +1624,76 @@ class _ProxyHandler:
                     self._proxy._untrack_connection(conn)
                     await conn.close()
 
+    async def _connect_via_sidecar(
+        self, host: str, port: int
+    ) -> tuple[ManagedConnection, Protocol]:
+        """Connect to target through the Go TLS sidecar.
+
+        The sidecar handles TCP → (SOCKS5) → Chrome-fingerprinted TLS.
+        Returns a plaintext ManagedConnection and the protocol the
+        target negotiated (h2 or http/1.1).
+
+        Call this BEFORE _negotiate_client_tls so you can restrict the
+        browser ALPN to match whatever the target supports.
+        """
+        sidecar = self._proxy.sidecar
+        if sidecar is None or sidecar.addr is None:
+            raise ConnectionError("Sidecar not available")
+
+        sidecar_addr = sidecar.addr  # Read dynamically (survives restarts)
+        socks = self._proxy.socks_proxy
+
+        sc_host, sc_port_str = sidecar_addr.rsplit(":", 1)
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(sc_host, int(sc_port_str)),
+            timeout=5.0,
+        )
+
+        try:
+            target = f"{host}:{port}"
+            if socks:
+                cmd = f"CONNECT {target} socks5://{socks}\n"
+            else:
+                cmd = f"CONNECT {target}\n"
+
+            writer.write(cmd.encode("utf-8"))
+            await writer.drain()
+
+            async with asyncio.timeout(self.config.connect_timeout):
+                resp_line = await reader.readline()
+
+            if not resp_line:
+                raise ConnectionError(f"Sidecar closed connection for {target}")
+
+            resp = resp_line.decode("utf-8", errors="replace").strip()
+
+            if resp.startswith("ERR "):
+                raise ConnectionError(f"Sidecar error for {target}: {resp[4:]}")
+            if not resp.startswith("OK "):
+                raise ConnectionError(f"Sidecar unexpected response: {resp}")
+
+            alpn = resp[3:].strip()
+            protocol = Protocol.HTTP2 if alpn == "h2" else Protocol.HTTP1
+
+            logger.debug("[SIDECAR] %s via %s (alpn=%s)", target, socks or "direct", alpn)
+            return ManagedConnection(reader, writer), protocol
+
+        except Exception:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+            raise
+
     # -- TLS ---------------------------------------------------------------
 
     async def _negotiate_client_tls(
-        self, client: ManagedConnection, hostname: str
+        self, client: ManagedConnection, hostname: str,
+        alpn: tuple[str, ...] = ("h2", "http/1.1"),
     ) -> tuple[Protocol, ManagedConnection]:
         loop = asyncio.get_event_loop()
-        ctx = self.tls.get_server_context(("h2", "http/1.1"))
+        ctx = self.tls.get_server_context(alpn)
 
         transport = client.writer.transport
         proto_obj = transport.get_protocol()
@@ -1617,8 +1707,8 @@ class _ProxyHandler:
             raise ConnectionError("Client TLS handshake failed")
 
         ssl_obj = ssl_transport.get_extra_info("ssl_object")
-        alpn = ssl_obj.selected_alpn_protocol() if ssl_obj else None
-        protocol = Protocol.HTTP2 if alpn == "h2" else Protocol.HTTP1
+        negotiated_alpn = ssl_obj.selected_alpn_protocol() if ssl_obj else None
+        protocol = Protocol.HTTP2 if negotiated_alpn == "h2" else Protocol.HTTP1
 
         tls_reader = StreamReader()
         tls_proto = asyncio.StreamReaderProtocol(tls_reader)
@@ -1629,10 +1719,15 @@ class _ProxyHandler:
         return protocol, ManagedConnection(tls_reader, tls_writer)
 
     async def _negotiate_target_tls(
-        self, target: ManagedConnection, hostname: str, protocol: Protocol
-    ) -> ManagedConnection:
+        self, target: ManagedConnection, hostname: str,
+    ) -> tuple[ManagedConnection, Protocol]:
+        """TLS handshake with target, offering both h2 and http/1.1.
+
+        Returns the wrapped connection and whichever protocol the
+        server actually negotiated. Works with TLS 1.2 and 1.3.
+        """
         loop = asyncio.get_event_loop()
-        ctx = self.tls.create_client_context(alpn=[protocol.value])
+        ctx = self.tls.create_client_context(alpn=["h2", "http/1.1"])
 
         transport = target.writer.transport
         proto_obj = transport.get_protocol()
@@ -1646,13 +1741,17 @@ class _ProxyHandler:
         if ssl_transport is None:
             raise ConnectionError("Target TLS handshake failed")
 
+        ssl_obj = ssl_transport.get_extra_info("ssl_object")
+        negotiated = ssl_obj.selected_alpn_protocol() if ssl_obj else None
+        target_protocol = Protocol.HTTP2 if negotiated == "h2" else Protocol.HTTP1
+
         tls_reader = StreamReader()
         tls_proto = asyncio.StreamReaderProtocol(tls_reader)
         ssl_transport.set_protocol(tls_proto)
         tls_proto.connection_made(ssl_transport)
         tls_writer = StreamWriter(ssl_transport, tls_proto, tls_reader, loop)
 
-        return ManagedConnection(tls_reader, tls_writer)
+        return ManagedConnection(tls_reader, tls_writer), target_protocol
 
     # -- target connection -------------------------------------------------
 
@@ -1741,6 +1840,7 @@ class SessionProxy:
         host: str = "127.0.0.1",
         port: int = 0,
         config: ProxyConfig = DEFAULT_CONFIG,
+        sidecar: Optional[SidecarManager] = None
     ):
         self.host = host
         self.port = port
@@ -1755,6 +1855,8 @@ class SessionProxy:
             self.socks_proxy = socks_pool.assign()
         else:
             self.socks_proxy = None
+
+        self.sidecar: Optional[SidecarManager] = sidecar
 
         self._tls = TLSInterceptor(ca_cert, ca_key)
         self._handler: Optional[_ProxyHandler] = None

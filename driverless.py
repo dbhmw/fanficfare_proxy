@@ -2,6 +2,9 @@ from __future__ import annotations
 import uvloop
 uvloop.install()
 import patch_func
+from utls_bridge.sidecar import SidecarManager
+from proxy_server import SessionProxy, SocksProxyPool, ProxyConfig
+
 from typing import Optional, Literal, Any, TypedDict, TextIO, cast
 import asyncio, zlib, argparse, configparser, sys, signal, logging
 import ssl, base64, hashlib, json, re, threading
@@ -10,7 +13,6 @@ from xvfbwrapper import Xvfb
 from asyncio.sslproto import SSLProtocol
 from asyncio import StreamReader, StreamWriter, StreamReaderProtocol
 from functools import partial
-from proxy_server import SessionProxy, SocksProxyPool, ProxyConfig
 
 from selenium_driverless import webdriver
 from selenium_driverless.types.by import By
@@ -286,10 +288,15 @@ class Init:
             if hasattr(self.args, 'mitm_ca_key') and self.args.mitm_ca_key is not None
             else self.config.get("server", "mitm_ca_key", fallback=self.key)
         )
-        self.force_mitm: bool = (
-            self.args.force_mitm
-            if hasattr(self.args, 'force_mitm') and self.args.force_mitm is not None
-            else self.config.getboolean("server", "force_mitm", fallback=False)
+        self.impersonate_chrome: str = (
+            self.args.impersonate_chrome
+            if hasattr(self.args, 'impersonate') and self.args.impersonate
+            else self.config.get("server", "impersonate", fallback='')
+        )
+        self.impersonate_port: int = (
+            self.args.impersonate_port
+            if hasattr(self.args, 'impersonate_port') and self.args.impersonate_port
+            else self.config.getint("server", "impersonate_port", fallback=0)
         )
 
     def prepserver(self) -> None:
@@ -628,7 +635,7 @@ class ProxyServer:
             packet_dict: ServerRequest = {
                 "method": method,
                 "url": packet_l[1],
-                #"url": "https://html.duckduckgo.com/html?q=my%20ip",
+                #"url": "https://tlsinfo.me/",
                 "headers": json.loads(packet_l[2]),
                 "parameters": packet_l[3],
                 "image": image,
@@ -721,12 +728,27 @@ class BrowserController:
         self.browser_lock: asyncio.Lock = asyncio.Lock()
         self.main_driver: webdriver.Chrome
         self.debug_weakrefs: dict[str, weakref.ReferenceType] = {}
+        self.fp_proxy: Optional[SidecarManager] = None
 
     @classmethod
     async def initialize(cls, config: Init) -> BrowserController:
         instance = cls(config)
         await instance.initialize_main_driver()
+        await instance.initialize_proxy()
         return instance
+
+    async def initialize_proxy(self) -> None:
+        try:
+            if self.config.impersonate_chrome:
+                sidecar = SidecarManager(
+                    binary_path=self.config.impersonate_chrome,
+                    listen_port=self.config.impersonate_port,
+                    auto_restart=False,
+                )
+                await sidecar.start()
+                self.fp_proxy = sidecar
+        except Exception as e:
+            logger.warning(e)
 
     @staticmethod
     def get_certificate_spki_hash(cert_path: str) -> str:
@@ -816,7 +838,7 @@ class BrowserController:
 
             logger.debug("New session %s %s", session, set_proxy)
 
-            drivenbrowser: DrivenBrowser = DrivenBrowser(weakref.ref(self.main_driver), self.config, session)
+            drivenbrowser: DrivenBrowser = DrivenBrowser(weakref.ref(self.main_driver), self.config, session, weakref.ref(self.fp_proxy) if self.fp_proxy else None)
             await drivenbrowser.initialize_socks5()
             weakref.finalize(drivenbrowser, lambda: logger.debug("Garbage collected driver"))
 
@@ -909,6 +931,8 @@ class BrowserController:
         tasks: list[asyncio.Task[None]] = [asyncio.create_task(self._shutdown_session(key))
              for key in list(self.sessions.keys())]
         await asyncio.gather(*tasks)
+        if self.fp_proxy:
+            await self.fp_proxy.stop()
         await self.destroy_main_driver()
 
     async def _shutdown_session(self, session: str) -> None:
@@ -998,7 +1022,8 @@ class BrowserController:
 class DrivenBrowser:
     def __init__(self, chrome: weakref.ReferenceType[webdriver.Chrome],
                 config: Init,
-                session: str):
+                session: str,
+                fp_proxy: Optional[weakref.ReferenceType[SidecarManager]]):
         self.chrome = chrome
         self.session = session
         self.sessiontabs: dict[int, Target] = {}
@@ -1013,6 +1038,7 @@ class DrivenBrowser:
         self.virt_disp: bool = config.virt_disp
         self.proxy_instance_port: int = 0
         self.socks_proxy_instance: SessionProxy
+        self.fp_proxy = fp_proxy
 
     async def get_browser(self) -> Context:
         if self.context is not None:
@@ -1024,7 +1050,7 @@ class DrivenBrowser:
         if chrome is None:
             raise RuntimeError("Chrome deleted")
 
-        await self.start_browser(chrome)
+        self.context = await self.start_browser(chrome)
         del chrome
         if not self.context:
             raise RuntimeError("No context")
@@ -1041,11 +1067,12 @@ class DrivenBrowser:
         logger.debug("Handed browser for %d", self.current_id)
         return self.context
 
-    async def start_browser(self, chrome: webdriver.Chrome) -> None:
+    async def start_browser(self, chrome: webdriver.Chrome) -> Context:
         # if type_browser:
         proxy: str = f"http://127.0.0.1:{self.proxy_instance_port}"
-        self.context = await chrome.new_context(proxy_server=proxy)
+        context = await chrome.new_context(proxy_server=proxy)
         logger.info("Started proxied context %s", proxy)
+        return context
 
     async def get_tab(self, requestid: int) -> tuple[Target, int]:
         if requestid in self.sessiontabs:
@@ -1106,8 +1133,6 @@ class DrivenBrowser:
                 trgt_id = tab.id
 
                 try:
-                    targets = await self.context.execute_cdp_cmd("Target.getTargets", {}, timeout=5)
-                    logger.debug(targets)
                     await tab.execute_cdp_cmd("Page.close", {}, timeout=5)
                 except Exception as e:
                     logger.debug(e)
@@ -1140,7 +1165,8 @@ class DrivenBrowser:
             socks_pool=SocksProxyPool(self.config.socks5_file),
             ca_cert=self.config.mitm_ca_cert,
             ca_key=self.config.mitm_ca_key,
-            config=ProxyConfig(connect_timeout=60.0)
+            config=ProxyConfig(connect_timeout=60.0),
+            sidecar = self.fp_proxy() if self.fp_proxy else None
         )
 
         self._proxy_started = threading.Event()
@@ -1651,6 +1677,9 @@ class ClientRequest:
         content_type: Optional[str] = None
         status_code: int = -10
         source: bytes = b"Failed"
+        # For the infinite redirection https://archiveofourown.org/works/38595468
+        redirects = 0
+        error = "None"
 
         if self.img_workaround:
             # Sometimes there is a need to reload or wait for a page to load. Sometimes it triggers a download.
@@ -1667,7 +1696,6 @@ class ClientRequest:
             del pg
 
         while True:
-            # For the infinite redirection https://archiveofourown.org/works/38595468
             self.links = self.condition_url(url, old)
 
             if image == "True":
@@ -1686,10 +1714,13 @@ class ClientRequest:
                         source = resp.body
                         content_type = resp.content_type.split(";", 1)[0]
                         response_headers = resp.headers
+                        if redirects > 7:
+                            status_code = 500
+                            error = "Too Many Redirects"
                         break
 
-                if 499 < status_code < 399:
-                    await tab.get("about:blank", wait_load=True, timeout=self.timeout)
+                if not (400 <= status_code < 500):
+                    await tab.get("about:blank", timeout=self.timeout)
                 result = await req
                 logger.debug("Reqeust result: %s", str(result))
             except CDPError as e:
@@ -1724,6 +1755,7 @@ class ClientRequest:
                 for header in response_headers:
                     if header[0] == 'location':
                         url = header[1]
+                        redirects += 1
                         logger.debug("Redirect [%s]", url)
                         break
                 continue
@@ -1743,7 +1775,7 @@ class ClientRequest:
 
         logger.info("Page returned: '%s'", content_type)
 
-        return (status_code, content_type, source, "None")
+        return (status_code, content_type, source, error)
 
     async def main(self, request: ServerRequest) -> ServerResponse:
         result: tuple[int, str, bytes, str] = (-1, "None", b"None", "Failed to get a page.")
@@ -1834,19 +1866,23 @@ logger.addHandler(ch)
 parser = argparse.ArgumentParser(description="SeleniumServer")
 parser.add_argument('-c','--config', type=str, metavar='PATH', default='./config.ini', help="Path to config")
 parser.add_argument("--xvfb", dest='xvfb', action=argparse.BooleanOptionalAction, default=None, help="Enable or disable Xvfb")
-parser.add_argument("--mitm", dest='mitm', action=argparse.BooleanOptionalAction, default=None, help="Enable or disable MITM proxy")
-parser.add_argument('--mitm-cert', dest='mitm_cert', type=str, metavar='PATH', help='Path to MITM cert')
-parser.add_argument('--mitm-key', dest='mitm_key', type=str, metavar='PATH', help='Path to MITM key')
-parser.add_argument('--mitm-port', dest='mitm_port', type=int, metavar='PORT', help='Port to run the mitm on.')
-parser.add_argument("--force-mitm", dest='force_mitm', action='store_true', help='Force the use of mitm.')
 parser.add_argument('--host', dest='host', type=str, metavar='HOST', default=None, help='Host/IP to bind (default: localhost)')
 parser.add_argument('--port', dest='port', type=int, metavar='PORT', default=None, help='Port to listen on (default: 23000)')
-parser.add_argument('--chrome', dest='chrome', type=str, metavar='PATH', help='Path to Chromium/Chrome executable')
+
 parser.add_argument('--cert', dest='cert', type=str, metavar='PATH', help='Path to server TLS certificate (PEM)')
 parser.add_argument('--key', dest='key', type=str, metavar='PATH', help='Path to server TLS private key (PEM)')
 parser.add_argument('--cacert', dest='cacert', type=str, metavar='PATH', help='Path to CA certificate for client verification (PEM)')
+
+parser.add_argument('--chrome', dest='chrome', type=str, metavar='PATH', help='Path to Chromium/Chrome executable')
 parser.add_argument('--ublock', dest='ublock', type=str, metavar='PATH', help='Path to extension file')
 parser.add_argument('--driver-timeout', dest='driver_timeout', type=int, metavar='SECONDS', default=None, help='Time in seconds to close Chrome after last request (default: 60)')
+
+parser.add_argument("--mitm", dest='mitm', action=argparse.BooleanOptionalAction, default=None, help="Enable or disable MITM proxy")
+parser.add_argument('--mitm-cert', dest='mitm_ca_key', type=str, metavar='PATH', help='Path to MITM cert')
+parser.add_argument('--mitm-key', dest='mitm_ca_cert', type=str, metavar='PATH', help='Path to MITM key')
+
+parser.add_argument('--impersonate', dest='impersonate', type=str, default='', help=argparse.SUPPRESS)
+parser.add_argument('--impersonate-port', dest='impersonate_port', type=int, metavar='PORT', help=argparse.SUPPRESS)
 
 handler = (lambda e: logger.debug(f'Event-handler: {e.__class__.__name__}: {str(e)}'))
 sys.modules["selenium_driverless"].EXC_HANDLER = handler # type: ignore

@@ -2,3 +2,5 @@ Certs/
 .mypy_cache/
 global_cookies
 __pycache__/
+*.md
+*.sum
