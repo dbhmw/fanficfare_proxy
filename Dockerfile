@@ -7,6 +7,7 @@ RUN pacman-key --init
 RUN pacman -Syu --noconfirm && \
     pacman -S --noconfirm \
     python \
+    go \
     uv \
     xorg-server-xvfb \
     xorg-setxkbmap \
@@ -37,11 +38,20 @@ RUN pacman -Syu --noconfirm && \
 
 # Create non-root user
 RUN useradd -m -u 1000 fff_proxy && \
-    mkdir -p /home/fff_proxy/proxy /home/fff_proxy/chromium /home/fff_proxy/certs && \
-    chown -R fff_proxy:fff_proxy /home/fff_proxy/proxy /home/fff_proxy/chromium /home/fff_proxy/certs
+    mkdir -p /home/fff_proxy/proxy /home/fff_proxy/chromium /home/fff_proxy/certs /home/fff_proxy/proxy/utls_bridge && \
+    chown -R fff_proxy:fff_proxy /home/fff_proxy/proxy /home/fff_proxy/chromium /home/fff_proxy/certs /home/fff_proxy/proxy/utls_bridge
 
 # Switch to appuser early
 USER fff_proxy
+
+WORKDIR /home/fff_proxy/proxy/utls_bridge
+
+COPY --chown=fff_proxy:fff_proxy --chmod=770 utls_bridge/go.mod .
+COPY --chown=fff_proxy:fff_proxy --chmod=770 utls_bridge/utls_bridge.go .
+COPY --chown=fff_proxy:fff_proxy --chmod=770 utls_bridge/sidecar.py .
+
+RUN go mod tidy
+RUN go build -o utls-bridge .
 
 # Set working directory
 WORKDIR /home/fff_proxy/proxy
