@@ -48,6 +48,7 @@ class ProxyConfig:
     """Proxy configuration with sensible defaults"""
 
     max_streams_per_connection: int = 100
+    verify_ssl: bool = True
 
     # Timeouts (seconds)
     connect_timeout: float = 120.0
@@ -397,9 +398,24 @@ class ManagedConnection:
             return
         self._closed = True
         try:
-            if not self.writer.is_closing():
-                self.writer.close()
-                await asyncio.wait_for(self.writer.wait_closed(), timeout=2.0)
+            transport = self.writer.transport
+            if transport is None or transport.is_closing():
+                return
+            # For SSL transports whose underlying connection is already
+            # gone, calling close() triggers asyncio to emit "SSL
+            # connection is closed" through the exception handler.
+            # Abort directly instead — it's a hard close but avoids noise.
+            ssl_obj = transport.get_extra_info("ssl_object")
+            if ssl_obj is not None:
+                try:
+                    # Peek at the SSL object; if it raises, the session
+                    # is already dead and a graceful close is pointless.
+                    ssl_obj.version()
+                except Exception:
+                    transport.abort()
+                    return
+            self.writer.close()
+            await asyncio.wait_for(self.writer.wait_closed(), timeout=2.0)
         except Exception as e:
             logger.trace(e)
 
@@ -545,8 +561,13 @@ class TLSInterceptor:
             self._server_ctx_cache[alpn] = ctx
         return self._server_ctx_cache[alpn]
 
-    def create_client_context(self, alpn: list[str] | None = None) -> ssl.SSLContext:
-        ctx = ssl.create_default_context()
+    def create_client_context(self, alpn: list[str] | None = None, verify: bool = True) -> ssl.SSLContext:
+        if verify:
+            ctx = ssl.create_default_context()
+        else:
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
         if alpn:
             ctx.set_alpn_protocols(alpn)
         return ctx
@@ -1013,13 +1034,14 @@ class Http2Handler:
 
     async def start_session(self, client: ManagedConnection, target: ManagedConnection, target_host: str) -> None:
         """Set up HTTP/2 connections on both sides and enter the handler loop."""
-        client_config = h2.config.H2Configuration(client_side=False)
+        # Turning off `validate_inbound_headers` for https://complexkari.files.wordpress.com/2019/06/aqua-hd-kh-0-2-birth-by-sleep-a-fragmentary-passage-kingdom-hearts-aqua-40335722-500-749.png
+        client_config = h2.config.H2Configuration(client_side=False, validate_inbound_headers=False)
         client_conn = h2.connection.H2Connection(config=client_config)
         client_conn.initiate_connection()
         client.writer.write(client_conn.data_to_send())
         await client.writer.drain()
 
-        target_config = h2.config.H2Configuration(client_side=True)
+        target_config = h2.config.H2Configuration(client_side=True, validate_inbound_headers=False)
         target_conn = h2.connection.H2Connection(config=target_config)
         target_conn.initiate_connection()
 
@@ -1315,21 +1337,6 @@ class Http2Handler:
                             cap.status_code = int(val)
                         else:
                             cap.headers.append((key, val))
-
-        # elif isinstance(event, h2.events.DataReceived):
-        #     stream = find_stream(event.stream_id)
-        #     if stream:
-        #         target_conn.acknowledge_received_data(
-        #             event.flow_controlled_length, event.stream_id
-        #         )
-        #         client_conn.send_data(
-        #             stream.client_id,
-        #             event.data,
-        #             end_stream=event.stream_ended is not None,
-        #         )
-        #         cap = captures.get(stream.client_id)
-        #         if cap:
-        #             cap.body.extend(event.data)
         elif isinstance(event, h2.events.DataReceived):
             stream = find_stream(event.stream_id)
             if stream:
@@ -1346,7 +1353,6 @@ class Http2Handler:
                     if cap:
                         self._proxy._deliver_capture(cap)
                     streams.pop(stream.client_id, None)
-        
         elif isinstance(event, h2.events.StreamEnded):
             stream = find_stream(event.stream_id)
             if stream:
@@ -1358,7 +1364,6 @@ class Http2Handler:
                 if cap:
                     self._proxy._deliver_capture(cap)
                 streams.pop(stream.client_id, None)
-
         elif isinstance(event, h2.events.StreamReset):
             stream = find_stream(event.stream_id)
             if stream:
@@ -1368,7 +1373,6 @@ class Http2Handler:
                     pass
                 captures.pop(stream.client_id, None)
                 streams.pop(stream.client_id, None)
-
         elif isinstance(event, h2.events.TrailersReceived):
             stream = find_stream(event.stream_id)
             if stream:
@@ -1376,7 +1380,6 @@ class Http2Handler:
                 cap = captures.pop(stream.client_id, None)
                 if cap:
                     self._proxy._deliver_capture(cap)
-
         elif isinstance(event, h2.events.ConnectionTerminated):
             last_id = getattr(event, "last_stream_id", None)
             error_code = getattr(event, "error_code", 0)
@@ -1386,13 +1389,11 @@ class Http2Handler:
                 "tearing down handler (%d active streams)",
                 last_id, error_code, additional, len(streams),
             )
-
             # Deliver any in-flight captures before cleanup
             for cid, cap in list(captures.items()):
                 if cap.status_code:
                     self._proxy._deliver_capture(cap)
             captures.clear()
-
             # Reset all active streams on the client side
             for stream in list(streams.values()):
                 try:
@@ -1400,7 +1401,6 @@ class Http2Handler:
                 except Exception:
                     pass
             streams.clear()
-
             # Forward GOAWAY to the client so it knows to reconnect
             try:
                 client_conn.close_connection(error_code=0)
@@ -1614,10 +1614,13 @@ class _ProxyHandler:
 
         except asyncio.TimeoutError:
             logger.warning("[%s:%d] Timeout", host, port)
+            self._proxy._deliver_connect_error(host, port, TimeoutError(f"CONNECT to {host}:{port} timed out"))
         except (ConnectionRefusedError, ConnectionError, OSError) as e:
             logger.warning("[%s:%d] Connection error: %s", host, port, e)
+            self._proxy._deliver_connect_error(host, port, e)
         except Exception as e:
             logger.error("[%s:%d] Error: %s\n%s", host, port, e, traceback.format_exc())
+            self._proxy._deliver_connect_error(host, port, e)
         finally:
             for conn in (target_tls, client_tls, target):
                 if conn:
@@ -1727,7 +1730,7 @@ class _ProxyHandler:
         server actually negotiated. Works with TLS 1.2 and 1.3.
         """
         loop = asyncio.get_event_loop()
-        ctx = self.tls.create_client_context(alpn=["h2", "http/1.1"])
+        ctx = self.tls.create_client_context(alpn=["h2", "http/1.1"], verify=self.config.verify_ssl)
 
         transport = target.writer.transport
         proto_obj = transport.get_protocol()
@@ -1882,6 +1885,32 @@ class SessionProxy:
             self.port,
             reuse_address=True,
         )
+        # Install a custom exception handler so asyncio's internal SSL
+        # errors (e.g. "SSL connection is closed") go through our logger
+        # instead of being printed raw to stderr.
+        loop = asyncio.get_running_loop()
+        _default_handler = loop.get_exception_handler()
+
+        def _quiet_exception_handler(loop: asyncio.AbstractEventLoop, context: dict) -> None:
+            msg = context.get("message", "")
+            exc = context.get("exception")
+
+            # Suppress noisy SSL-closed messages at TRACE level
+            if exc and "SSL" in type(exc).__name__:
+                logger.debug("asyncio SSL exception (suppressed): %s", exc)
+                return
+            if isinstance(msg, str) and "ssl" in msg.lower():
+                logger.debug("asyncio SSL message (suppressed): %s", msg)
+                return
+
+            # Everything else goes through the default handler
+            if _default_handler:
+                _default_handler(loop, context)
+            else:
+                loop.default_exception_handler(context)
+
+        loop.set_exception_handler(_quiet_exception_handler)
+
         # Resolve actual port (useful when port=0)
         sock = self._server.sockets[0]
         self.port = sock.getsockname()[1]
@@ -1968,6 +1997,44 @@ class SessionProxy:
                 pattern = ic.matches(response.url)
                 if pattern is not None:
                     ic._deliver_threadsafe(pattern, response)
+
+    def _deliver_connect_error(self, host: str, port: int, error: Exception) -> None:
+        """Notify interceptors that a CONNECT tunnel to *host:port* failed.
+
+        Synthesises a 502 ``InterceptedResponse`` for every registered
+        pattern whose URL targets this host so that callers blocked on
+        ``cap.get()`` / ``cap.all()`` are unblocked immediately instead
+        of hanging until timeout.
+        """
+        scheme = "https" if port == 443 else "http"
+        prefix = f"{scheme}://{host}"
+        error_body = f"CONNECT tunnel failed: {error}".encode("utf-8")
+
+        with self._interceptor_lock:
+            for ic in self._interceptors:
+                matched_patterns: list[str] = []
+
+                for pat in ic._exact_urls:
+                    if pat == prefix or pat.startswith(prefix + "/") or pat.startswith(prefix + ":"):
+                        matched_patterns.append(pat)
+
+                for pat in ic._glob_patterns:
+                    if pat.startswith(prefix + "/") or pat.startswith(prefix + ":") or pat == prefix:
+                        matched_patterns.append(pat)
+
+                for pat in matched_patterns:
+                    resp = InterceptedResponse(
+                        url=pat,
+                        status_code=502,
+                        headers=[("content-type", "text/plain")],
+                        body=error_body,
+                        content_type="text/plain",
+                        content_encoding="",
+                    )
+                    ic._deliver_threadsafe(pat, resp)
+                    logger.debug(
+                        "[CONNECT-ERR] Delivered 502 to interceptor for pattern: %s", pat
+                    )
 
     # -- Connections tracker --------------------------------------------------
 

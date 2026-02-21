@@ -55,6 +55,7 @@ type Config struct {
 	IdleTimeout    time.Duration
 	BufferSize     int
 	MaxConns       int64
+	Insecure       bool
 }
 
 // ---------------------------------------------------------------------------
@@ -202,7 +203,7 @@ func dialSOCKS5(ctx context.Context, proxyAddr, targetHost string, targetPort in
 // Chrome TLS handshake
 // ---------------------------------------------------------------------------
 
-func chromeHandshake(ctx context.Context, conn net.Conn, hostname string) (*tls.UConn, string, error) {
+func chromeHandshake(ctx context.Context, conn net.Conn, hostname string, insecure bool) (*tls.UConn, string, error) {
 	// HelloChrome_Auto replicates the latest stable Chrome ClientHello
 	// byte-for-byte: GREASE, extension order, cipher suites, groups
 	// (incl X25519MLKEM768), ECH, ALPS, compress_certificate.
@@ -211,7 +212,7 @@ func chromeHandshake(ctx context.Context, conn net.Conn, hostname string) (*tls.
 	// modify it — changing ALPN would alter the fingerprint hash.
 	uconn := tls.UClient(conn, &tls.Config{
 		ServerName:         hostname,
-		InsecureSkipVerify: false,
+		InsecureSkipVerify: insecure,
 	}, tls.HelloChrome_Auto)
 
 	if deadline, ok := ctx.Deadline(); ok {
@@ -321,7 +322,7 @@ func doConnect(conn net.Conn, reader *bufio.Reader, fields []string, cfg Config)
 
 	// chromeHandshake closes the underlying conn (via uconn.Close()) on
 	// failure, so we must NOT call targetConn.Close() again here.
-	tlsConn, alpn, err := chromeHandshake(ctx, targetConn, host)
+	tlsConn, alpn, err := chromeHandshake(ctx, targetConn, host, cfg.Insecure)
 	if err != nil {
 		writeResp(conn, cfg, fmt.Sprintf("ERR %s\n", err))
 		conn.Close()
@@ -429,6 +430,7 @@ func main() {
 	bufSize := flag.Int("buffer", 65536, "Copy buffer size")
 	maxConns := flag.Int64("max-conns", 0, "Max concurrent conns (0=unlimited)")
 	statsInterval := flag.Duration("stats-interval", 60*time.Second, "Stats log interval")
+	insecure := flag.Bool("insecure", false, "Skip TLS certificate verification")
 	flag.Parse()
 
 	cfg := Config{
@@ -439,6 +441,7 @@ func main() {
 		IdleTimeout:    *idleTimeout,
 		BufferSize:     *bufSize,
 		MaxConns:       *maxConns,
+		Insecure:       *insecure,
 	}
 
 	ln, err := net.Listen("tcp", cfg.ListenAddr)

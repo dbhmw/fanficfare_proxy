@@ -276,6 +276,13 @@ class Init:
             if hasattr(self.args, 'socks5_file') and self.args.socks5_file is not None
             else self.config.get("server", "socks5_file", fallback='')
         )
+        self.verify_ssl: bool = (
+            self.args.verify_ssl
+            if hasattr(self.args, 'verify_ssl')
+            else self.config.getboolean("server", "verify_ssl", fallback=True)
+        )
+        if not self.verify_ssl:
+            logger.warning("SSL cert verification disabled")
         # For TLS interception, use dedicated CA cert/key
         # Generate these with: python3 generate_ca.py --output-dir ./certs
         self.mitm_ca_cert: str = (
@@ -635,11 +642,9 @@ class ProxyServer:
             packet_dict: ServerRequest = {
                 "method": method,
                 "url": packet_l[1],
-                #"url": "https://tlsinfo.me/",
                 "headers": json.loads(packet_l[2]),
                 "parameters": packet_l[3],
                 "image": image,
-                #"image": "True",
                 "cookies": json.loads(packet_l[5]),
                 "session": packet_l[6],
                 "heartbeat": packet_l[7]
@@ -744,6 +749,7 @@ class BrowserController:
                     binary_path=self.config.impersonate_chrome,
                     listen_port=self.config.impersonate_port,
                     auto_restart=False,
+                    verify_ssl=self.config.verify_ssl
                 )
                 await sidecar.start()
                 self.fp_proxy = sidecar
@@ -1165,7 +1171,7 @@ class DrivenBrowser:
             socks_pool=SocksProxyPool(self.config.socks5_file),
             ca_cert=self.config.mitm_ca_cert,
             ca_key=self.config.mitm_ca_key,
-            config=ProxyConfig(connect_timeout=60.0),
+            config=ProxyConfig(connect_timeout=61.0, verify_ssl=self.config.verify_ssl),
             sidecar = self.fp_proxy() if self.fp_proxy else None
         )
 
@@ -1364,7 +1370,6 @@ class ClientRequest:
         self.requestid: int = random.randint(-100000, 100000)
         self.links: list[str] = []
         self.request_queue: asyncio.Queue[ChromeResponse]
-        self.fetch_enabled = False
 
     async def cloudflare_captcha_checked(self, tab: Target, session: str) -> bool:
         try:
@@ -1630,6 +1635,12 @@ class ClientRequest:
         return [https_url, http_url, https_url_part, http_url_part]
 
     async def correct_image_content(self, url: str, status_code: int, content_type: str, source: bytes) -> str:
+        def check(pattern: bytes):
+            link = re.search(pattern, source)
+            if link:
+                new_url: str = (link.group(1)).decode()
+                logger.info(f"Changing '{url}' -> '{new_url}'")
+                raise OutdatedUrlError(new_url)
         # Dropbox just starts a download and returns application/binary content type but the picture is still in the req
         # https://www.giantbomb.com/a/uploads/scale_medium/8/87790/2549843-box_gawg3.png returns application/octet-stream
         # https://archiveofourown.org/works/61648471
@@ -1649,17 +1660,16 @@ class ClientRequest:
         # The same can be said about imgbox.com
         if content_type == 'text/html':
             if urllib.parse.urlsplit(url).netloc == 'imgur.com':
-                link = re.search(br'<meta name=\"twitter:image\" data-react-helmet=\"true\" content=\"(.+?)\"><link rel=\"alternate\" type=\"application/json\+oembed\"', source)
-                if link:
-                    imgur_url: str = (link.group(1)).decode()
-                    logger.debug("Changing 'imgur.com' -> 'i.imgur.com'")
-                    raise OutdatedUrlError(imgur_url)
+                check(br'<meta name=\"twitter:image\" data-react-helmet=\"true\" content=\"(.+?)\"><link rel=\"alternate\" type=\"application/json\+oembed\"')
             if urllib.parse.urlsplit(url).netloc == 'imgbox.com':
-                link = re.search(br'<meta property=\"og:image\" content=\"(.+?)\"/>', source)
-                if link:
-                    imgbox_url: str = (link.group(1)).decode()
-                    logger.debug("Changing 'imgbox.com'")
-                    raise OutdatedUrlError(imgbox_url)
+                check(br'<meta property=\"og:image\" content=\"(.+?)\"/>')
+            if urllib.parse.urlsplit(url).netloc == 'postimg.cc':
+                check(br'<meta property=\"og:image\" content=\"(.+?)\">')
+            if urllib.parse.urlsplit(url).netloc.startswith("furry34com"):
+                raise RefererError("Removing referer")
+            if 'pinterest.com' in urllib.parse.urlsplit(url).netloc:
+                check(br'<link as="image" fetchPriority="high" href="(.+?)" ')
+
         if not self.img_workaround:
             if not content_type.lower().startswith('image'):
                 raise ImageError(content_type, (status_code, content_type, source, "Not an image"))
@@ -1707,8 +1717,8 @@ class ClientRequest:
             try:
                 logger.debug("URL: %s | Referer: %s", self.links[0], str(referer))
                 await tab.execute_cdp_cmd("Network.clearBrowserCache")
-                req = asyncio.create_task(tab.get(self.links[0], referrer=referer, wait_load=False, timeout=self.timeout))
                 async with self.drivenbrowser().intercept_urls(self.links) as cap:
+                    req = asyncio.create_task(tab.get(self.links[0], referrer=referer, wait_load=False, timeout=self.timeout))
                     async for resp in cap:
                         status_code = resp.status_code
                         source = resp.body
@@ -1741,16 +1751,7 @@ class ClientRequest:
                 if image == "True":
                     await self.drivenbrowser().remove_intercept_rule()
 
-            # Will this ever be reached?
-            if status_code == -10 or not content_type or not response_headers:
-                if not self.img_workaround:
-                    raise ImageError("Did not get headers", (-1, "None", b"None", "Did not get headers"))
-                status_code = -1
-                return (status_code, "None", b"None", f"Could not get a full response ({headers})")
-
-            logger.info("Page returned: '%s'", str(status_code))
-
-            if status_code in [301, 302, 303, 307, 308]:
+            if status_code in [301, 302, 303, 307, 308] and response_headers:
                 old = self.links[0]
                 for header in response_headers:
                     if header[0] == 'location':
@@ -1759,16 +1760,21 @@ class ClientRequest:
                         logger.debug("Redirect [%s]", url)
                         break
                 continue
-            break
 
-        # for header in response_headers:
-        #     if header['name'].lower() == 'content-type':
-        #         content_type = header['value'].split(";", 1)[0]
-        #         break
-        # else:
-        #     # 'https://fbi.cults3d.com/uploaders/15065999/illustration-file/394535b8-90c7-463c-a14a-d963a7b052dc/Brigthcrest.jpg'
-        #     logger.warning('No content type! Assume image.')
-        #     content_type = "image/None"
+            if image == "True" and not content_type:
+                # 'https://fbi.cults3d.com/uploaders/15065999/illustration-file/394535b8-90c7-463c-a14a-d963a7b052dc/Brigthcrest.jpg'
+                logger.warning('No content type! Assume image.')
+                content_type = "image/None"
+
+            if status_code == -10 or not content_type or not response_headers:
+                logger.debug(response_headers)
+                if not self.img_workaround:
+                    raise ImageError("Did not get headers", (-1, "None", b"None", "Did not get headers"))
+                status_code = -1
+                return (status_code, "None", b"None", f"Could not get a full response ({headers})")
+
+            logger.info("Page returned: '%s'", str(status_code))
+            break
 
         if image == "True":
             content_type = await self.correct_image_content(url, status_code, content_type, source)
@@ -1868,6 +1874,7 @@ parser.add_argument('-c','--config', type=str, metavar='PATH', default='./config
 parser.add_argument("--xvfb", dest='xvfb', action=argparse.BooleanOptionalAction, default=None, help="Enable or disable Xvfb")
 parser.add_argument('--host', dest='host', type=str, metavar='HOST', default=None, help='Host/IP to bind (default: localhost)')
 parser.add_argument('--port', dest='port', type=int, metavar='PORT', default=None, help='Port to listen on (default: 23000)')
+parser.add_argument('--no-verify-ssl', dest='verify_ssl', action='store_false', help='Disable SSL cert verification')
 
 parser.add_argument('--cert', dest='cert', type=str, metavar='PATH', help='Path to server TLS certificate (PEM)')
 parser.add_argument('--key', dest='key', type=str, metavar='PATH', help='Path to server TLS private key (PEM)')
@@ -1877,7 +1884,6 @@ parser.add_argument('--chrome', dest='chrome', type=str, metavar='PATH', help='P
 parser.add_argument('--ublock', dest='ublock', type=str, metavar='PATH', help='Path to extension file')
 parser.add_argument('--driver-timeout', dest='driver_timeout', type=int, metavar='SECONDS', default=None, help='Time in seconds to close Chrome after last request (default: 60)')
 
-parser.add_argument("--mitm", dest='mitm', action=argparse.BooleanOptionalAction, default=None, help="Enable or disable MITM proxy")
 parser.add_argument('--mitm-cert', dest='mitm_ca_key', type=str, metavar='PATH', help='Path to MITM cert')
 parser.add_argument('--mitm-key', dest='mitm_ca_cert', type=str, metavar='PATH', help='Path to MITM key')
 

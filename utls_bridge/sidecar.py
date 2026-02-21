@@ -105,6 +105,7 @@ class SidecarManager:
         max_restarts: int = 10,
         startup_timeout: float = 15.0,
         extra_args: Optional[list[str]] = None,
+        verify_ssl: bool = True
     ):
         self.binary_path = binary_path
         self.listen_host = listen_host
@@ -118,6 +119,7 @@ class SidecarManager:
         self.max_restarts = max_restarts
         self.startup_timeout = startup_timeout
         self.extra_args = extra_args or []
+        self.verify_ssl = verify_ssl
 
         # Runtime state
         self._process: Optional[asyncio.subprocess.Process] = None
@@ -319,6 +321,8 @@ class SidecarManager:
         ]
         if self.max_conns > 0:
             args.extend(["--max-conns", str(self.max_conns)])
+        if not self.verify_ssl:
+            args.append("--insecure")
         args.extend(self.extra_args)
         return args
 
