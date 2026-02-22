@@ -1,18 +1,41 @@
 """
 SidecarManager — manages the Go TLS sidecar subprocess from Python.
 
-Drop this file alongside your proxy.py and import SidecarManager.
+The Go sidecar provides Chrome-fingerprinted TLS connections that are
+indistinguishable from a real Chrome browser at the JA3/JA4 fingerprint
+level.  This module handles the full lifecycle of that subprocess:
+spawning, readiness detection, health checks, graceful shutdown, and
+automatic restart on crash.
+
+Architecture
+~~~~~~~~~~~~
+The sidecar is a single long-lived process shared across all
+``SessionProxy`` instances.  Each proxy communicates its own SOCKS
+address per-connection via the ``CONNECT`` command — there is no global
+SOCKS configuration baked into the sidecar.
+
+The manager reads the sidecar's ``READY <addr>`` line on startup to
+learn the bound address.  If the sidecar crashes, the monitor loop
+detects the exit and restarts the process on the **same port** so that
+existing ``SessionProxy`` instances don't need to be reconfigured.
+
+Thread safety
+~~~~~~~~~~~~~
+The manager is designed for use from a single asyncio event loop.  The
+``addr`` property is read by ``SessionProxy`` tasks on that same loop.
+No cross-thread synchronisation is needed because all access is
+single-threaded under asyncio's cooperative scheduling.
 
 Usage::
 
     from sidecar import SidecarManager
 
-    # As context manager
+    # As async context manager (recommended)
     async with SidecarManager("/path/to/tls-sidecar") as sidecar:
         proxy = SessionProxy(..., sidecar=sidecar)
         ...
 
-    # Or manual lifecycle
+    # Manual lifecycle
     sidecar = SidecarManager("/path/to/tls-sidecar")
     await sidecar.start()
     ...
@@ -32,7 +55,7 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 
-# ── Sentinel for fields we know about ──
+# ── Known stat fields — guards against new Go-side fields breaking us ──
 _STATS_FIELDS = frozenset({
     "active_conns", "total_conns", "total_bytes",
     "tls_handshakes", "tls_errors", "socks_conns",
@@ -42,7 +65,30 @@ _STATS_FIELDS = frozenset({
 
 @dataclass
 class SidecarStats:
-    """Stats snapshot from the Go sidecar."""
+    """Point-in-time stats snapshot from the Go sidecar.
+
+    Mirrors the ``StatsSnapshot`` struct in the Go code.  Fields are
+    populated from the JSON response to the ``STATS`` command.
+
+    Attributes
+    ----------
+    active_conns:
+        Currently open CONNECT pipes.
+    total_conns:
+        Lifetime CONNECT count since the sidecar started.
+    total_bytes:
+        Total bytes piped in both directions.
+    tls_handshakes:
+        Successful TLS handshakes.
+    tls_errors:
+        Failed TLS handshakes.
+    socks_conns:
+        Successful SOCKS5 tunnel establishments.
+    uptime_seconds:
+        Seconds since the sidecar process started.
+    goroutines:
+        Current Go runtime goroutine count.
+    """
     active_conns: int = 0
     total_conns: int = 0
     total_bytes: int = 0
@@ -56,39 +102,40 @@ class SidecarStats:
 class SidecarManager:
     """Manages the Go TLS sidecar process lifecycle.
 
-    Starts the sidecar as an asyncio subprocess, waits for the READY
-    signal, provides health checks and stats, handles graceful shutdown
-    and optional auto-restart.
-
-    The sidecar is shared across all SessionProxy instances. Each proxy
-    passes its own SOCKS address per-connection via the CONNECT command.
+    Starts the sidecar as an asyncio subprocess, waits for the
+    ``READY`` signal, provides health checks and stats, handles
+    graceful shutdown and optional auto-restart.
 
     Parameters
     ----------
-    binary_path : str
+    binary_path:
         Path to the compiled ``tls-sidecar`` Go binary.
-    listen_host : str
-        Host for the sidecar to bind to. Default ``127.0.0.1``.
-    listen_port : int
-        Port to listen on. ``0`` = OS-assigned (recommended).
-    connect_timeout : float
-        Sidecar's timeout for TCP + SOCKS + TLS handshake (seconds).
-    idle_timeout : float
+    listen_host:
+        Host for the sidecar to bind to.  Default ``127.0.0.1``.
+    listen_port:
+        Port to listen on.  ``0`` means OS-assigned (recommended).
+    connect_timeout:
+        Sidecar's timeout for TCP + SOCKS5 + TLS handshake (seconds).
+    idle_timeout:
         Sidecar's pipe idle timeout (seconds).
-    stats_interval : float
-        How often the sidecar logs internal stats (seconds). 0 = disabled.
-    max_conns : int
-        Max concurrent connections. 0 = unlimited.
-    auto_restart : bool
-        If True, automatically restart the sidecar if it crashes.
-    restart_delay : float
+    stats_interval:
+        How often the sidecar logs internal stats (seconds).  0 disables.
+    max_conns:
+        Max concurrent connections.  0 means unlimited.
+    auto_restart:
+        If ``True``, automatically restart the sidecar if it crashes.
+    restart_delay:
         Seconds to wait before restarting after a crash.
-    max_restarts : int
-        Maximum consecutive restarts before giving up. Reset on successful ping.
-    startup_timeout : float
-        Max seconds to wait for READY signal on startup.
-    extra_args : list[str]
+    max_restarts:
+        Maximum consecutive restarts before giving up.  The counter
+        resets on a successful ``ping()``.
+    startup_timeout:
+        Max seconds to wait for the ``READY`` signal on startup.
+    extra_args:
         Additional CLI arguments to pass to the sidecar binary.
+    verify_ssl:
+        Whether the sidecar should verify target TLS certificates.
+        Set ``False`` only for development/testing.
     """
 
     def __init__(
@@ -105,7 +152,7 @@ class SidecarManager:
         max_restarts: int = 10,
         startup_timeout: float = 15.0,
         extra_args: Optional[list[str]] = None,
-        verify_ssl: bool = True
+        verify_ssl: bool = True,
     ):
         self.binary_path = binary_path
         self.listen_host = listen_host
@@ -121,47 +168,54 @@ class SidecarManager:
         self.extra_args = extra_args or []
         self.verify_ssl = verify_ssl
 
-        # Runtime state
+        # ── Runtime state ──
         self._process: Optional[asyncio.subprocess.Process] = None
         self._addr: Optional[str] = None
-        self._bound_port: Optional[int] = None  # Remembered for stable restarts
+        self._bound_port: Optional[int] = None  # remembered for stable restarts
         self._monitor_task: Optional[asyncio.Task] = None
         self._io_tasks: list[asyncio.Task] = []  # stdout/stderr forwarders
         self._stopping = False
         self._restart_count = 0
         self._started_at: Optional[float] = None
 
-    # -- properties --------------------------------------------------------
+    # ── properties ────────────────────────────────────────────────────────
 
     @property
     def addr(self) -> Optional[str]:
-        """The sidecar's bound address ("127.0.0.1:PORT") or None if not running."""
+        """The sidecar's bound address (``"127.0.0.1:PORT"``) or ``None``."""
         return self._addr
 
     @property
     def running(self) -> bool:
-        """True if the sidecar process is alive."""
+        """``True`` if the sidecar process is alive."""
         return self._process is not None and self._process.returncode is None
 
     @property
     def pid(self) -> Optional[int]:
-        """PID of the sidecar process, or None."""
+        """PID of the sidecar process, or ``None``."""
         return self._process.pid if self._process else None
 
     @property
     def uptime(self) -> float:
-        """Seconds since the sidecar was started."""
+        """Seconds since the sidecar was started (0.0 if not running)."""
         if self._started_at is None:
             return 0.0
         return time.monotonic() - self._started_at
 
-    # -- lifecycle ---------------------------------------------------------
+    # ── lifecycle ─────────────────────────────────────────────────────────
 
     async def start(self) -> str:
         """Start the sidecar and wait for it to be ready.
 
-        Returns the bound address string ("host:port").
-        Raises RuntimeError if the sidecar fails to start.
+        Returns
+        -------
+        str
+            The bound address (``"host:port"``).
+
+        Raises
+        ------
+        RuntimeError
+            If the sidecar fails to start within ``startup_timeout``.
         """
         if self.running:
             logger.warning("Sidecar already running (pid=%d)", self.pid)
@@ -174,7 +228,9 @@ class SidecarManager:
         self._started_at = time.monotonic()
         self._restart_count = 0
 
-        # Remember port for stable restarts (so addr doesn't change)
+        # Remember the port so restarts bind to the same address.
+        # This means SessionProxy instances don't need to be
+        # reconfigured after a sidecar crash + restart.
         _, port_str = self._addr.rsplit(":", 1)
         self._bound_port = int(port_str)
 
@@ -190,12 +246,19 @@ class SidecarManager:
     async def stop(self, timeout: float = 10.0) -> None:
         """Gracefully stop the sidecar.
 
-        Sends SIGTERM, waits up to ``timeout`` seconds, then SIGKILL.
+        Sends ``SIGTERM``, waits up to *timeout* seconds, then ``SIGKILL``.
+
+        Parameters
+        ----------
+        timeout:
+            Maximum seconds to wait for graceful shutdown before killing.
         """
         self._stopping = True
-        self._addr = None  # Immediately signal "unavailable" to SessionProxy
+        # Immediately signal "unavailable" so SessionProxy connections
+        # fail fast rather than trying to use a dying process.
+        self._addr = None
 
-        # Cancel monitor
+        # Cancel monitor task
         if self._monitor_task and not self._monitor_task.done():
             self._monitor_task.cancel()
             try:
@@ -218,7 +281,7 @@ class SidecarManager:
 
         logger.info("Stopping sidecar (pid=%d)...", proc.pid)
 
-        # SIGTERM for graceful shutdown
+        # SIGTERM → the Go sidecar closes its listener and drains
         try:
             proc.send_signal(signal.SIGTERM)
         except ProcessLookupError:
@@ -229,7 +292,9 @@ class SidecarManager:
             await asyncio.wait_for(proc.wait(), timeout=timeout)
             logger.info("Sidecar stopped gracefully (rc=%d)", proc.returncode)
         except asyncio.TimeoutError:
-            logger.warning("Sidecar didn't stop in %.1fs, sending SIGKILL", timeout)
+            logger.warning(
+                "Sidecar didn't stop in %.1fs, sending SIGKILL", timeout
+            )
             try:
                 proc.kill()
                 await asyncio.wait_for(proc.wait(), timeout=3.0)
@@ -240,17 +305,29 @@ class SidecarManager:
         self._process = None
 
     async def restart(self) -> str:
-        """Stop and restart the sidecar. Returns new bound address."""
+        """Stop and restart the sidecar.
+
+        Returns
+        -------
+        str
+            The new bound address (should match the old one if the port
+            was successfully reused).
+        """
         was_auto = self.auto_restart
         self.auto_restart = False  # prevent monitor from interfering
         await self.stop()
         self.auto_restart = was_auto
         return await self.start()
 
-    # -- health checks -----------------------------------------------------
+    # ── health checks ─────────────────────────────────────────────────────
 
     async def ping(self, timeout: float = 5.0) -> bool:
-        """Send PING to sidecar, expect PONG. Returns True if healthy."""
+        """Send ``PING`` to the sidecar, expect ``PONG``.
+
+        Returns ``True`` if the sidecar responded correctly.  A
+        successful ping resets the consecutive restart counter, so
+        transient crashes don't exhaust the restart budget.
+        """
         if not self._addr:
             return False
         try:
@@ -262,10 +339,12 @@ class SidecarManager:
             try:
                 writer.write(b"PING\n")
                 await writer.drain()
-                resp = await asyncio.wait_for(reader.readline(), timeout=timeout)
+                resp = await asyncio.wait_for(
+                    reader.readline(), timeout=timeout
+                )
                 ok = resp.strip() == b"PONG"
                 if ok:
-                    self._restart_count = 0
+                    self._restart_count = 0  # healthy → reset counter
                 return ok
             finally:
                 writer.close()
@@ -278,7 +357,13 @@ class SidecarManager:
             return False
 
     async def stats(self, timeout: float = 5.0) -> Optional[SidecarStats]:
-        """Query sidecar stats. Returns SidecarStats or None on failure."""
+        """Query sidecar stats.
+
+        Returns
+        -------
+        SidecarStats or None
+            Stats snapshot, or ``None`` if the query failed.
+        """
         if not self._addr:
             return None
         try:
@@ -290,9 +375,12 @@ class SidecarManager:
             try:
                 writer.write(b"STATS\n")
                 await writer.drain()
-                resp = await asyncio.wait_for(reader.readline(), timeout=timeout)
+                resp = await asyncio.wait_for(
+                    reader.readline(), timeout=timeout
+                )
                 data = json.loads(resp.decode("utf-8").strip())
-                # Filter to known fields so new Go-side fields don't break us
+                # Filter to known fields so new Go-side fields don't
+                # break the dataclass constructor.
                 filtered = {k: v for k, v in data.items() if k in _STATS_FIELDS}
                 return SidecarStats(**filtered)
             finally:
@@ -305,12 +393,15 @@ class SidecarManager:
             logger.debug("Sidecar stats failed: %s", e)
             return None
 
-    # -- internal ----------------------------------------------------------
+    # ── internal ──────────────────────────────────────────────────────────
 
     def _build_args(self) -> list[str]:
-        """Build CLI arguments for the sidecar binary."""
-        # On restart, use the previously bound port for address stability.
-        # This way all existing SessionProxy instances keep working.
+        """Build the CLI argument list for the sidecar binary.
+
+        On restart, reuses ``_bound_port`` so the address stays stable
+        and existing ``SessionProxy`` instances keep working without
+        reconfiguration.
+        """
         port = self._bound_port if self._bound_port is not None else self.listen_port
         args = [
             self.binary_path,
@@ -327,11 +418,17 @@ class SidecarManager:
         return args
 
     async def _spawn(self) -> str:
-        """Spawn the sidecar process and wait for READY signal.
+        """Spawn the sidecar process and wait for the ``READY`` signal.
 
-        Returns the bound address from the READY line.
+        Returns the bound address from the ``READY`` line.
+
+        Raises
+        ------
+        RuntimeError
+            If the sidecar exits during startup, prints ``ERROR``, or
+            doesn't become ready within ``startup_timeout``.
         """
-        # Cancel any leftover I/O tasks from a previous process
+        # Clean up any leftover I/O tasks from a previous process
         await self._cancel_io_tasks()
 
         args = self._build_args()
@@ -343,20 +440,22 @@ class SidecarManager:
             stderr=asyncio.subprocess.PIPE,
         )
 
-        # Start stderr forwarder (Go log output goes to stderr)
+        # Start stderr forwarder (Go's log.Printf writes to stderr)
         stderr_task = asyncio.create_task(
             self._forward_stderr(), name="sidecar-stderr"
         )
         self._io_tasks.append(stderr_task)
 
-        # Wait for READY line on stdout
+        # Wait for the READY line on stdout
         try:
             addr = await asyncio.wait_for(
                 self._wait_ready(), timeout=self.startup_timeout
             )
             return addr
         except asyncio.TimeoutError:
-            logger.error("Sidecar failed to start within %.1fs", self.startup_timeout)
+            logger.error(
+                "Sidecar failed to start within %.1fs", self.startup_timeout
+            )
             await self._kill_process()
             raise RuntimeError(
                 f"Sidecar failed to start within {self.startup_timeout}s"
@@ -366,14 +465,22 @@ class SidecarManager:
             raise
 
     async def _wait_ready(self) -> str:
-        """Read stdout until we see 'READY <addr>' or 'ERROR <msg>'."""
+        """Read stdout until we see ``READY <addr>`` or ``ERROR <msg>``.
+
+        Any other lines are forwarded to the Python logger at DEBUG
+        level (the sidecar shouldn't print anything else before READY,
+        but we handle it gracefully).
+        """
         assert self._process and self._process.stdout
 
         while True:
             line = await self._process.stdout.readline()
             if not line:
+                # Process exited before printing READY
                 rc = await self._process.wait()
-                raise RuntimeError(f"Sidecar exited during startup (rc={rc})")
+                raise RuntimeError(
+                    f"Sidecar exited during startup (rc={rc})"
+                )
 
             decoded = line.decode("utf-8", errors="replace").strip()
 
@@ -391,10 +498,11 @@ class SidecarManager:
                 msg = decoded[6:].strip()
                 raise RuntimeError(f"Sidecar startup error: {msg}")
 
+            # Unexpected pre-READY output — log and continue waiting
             logger.debug("[sidecar:stdout] %s", decoded)
 
     async def _forward_stdout(self) -> None:
-        """Forward remaining sidecar stdout to Python logger."""
+        """Forward remaining sidecar stdout to the Python logger."""
         try:
             if not self._process or not self._process.stdout:
                 return
@@ -408,7 +516,7 @@ class SidecarManager:
             pass
 
     async def _forward_stderr(self) -> None:
-        """Forward sidecar stderr (Go log output) to Python logger."""
+        """Forward sidecar stderr (Go ``log.Printf`` output) to the Python logger."""
         try:
             if not self._process or not self._process.stderr:
                 return
@@ -432,7 +540,7 @@ class SidecarManager:
             await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _kill_process(self) -> None:
-        """Force-kill the process if it's still running."""
+        """Force-kill the sidecar process if it's still running."""
         await self._cancel_io_tasks()
         if self._process and self._process.returncode is None:
             try:
@@ -442,7 +550,27 @@ class SidecarManager:
                 pass
 
     async def _monitor_loop(self) -> None:
-        """Background task: monitor sidecar process and auto-restart on crash."""
+        """Background task: detect sidecar crashes and auto-restart.
+
+        Polls every 5 seconds.  On crash detection:
+
+        1. Sets ``_addr = None`` so SessionProxy connections fail fast.
+        2. Checks the restart budget (``max_restarts``).
+        3. Waits ``restart_delay`` seconds.
+        4. Spawns a new process on the same port.
+
+        If the restart also fails (e.g. port conflict), the error is
+        logged and the loop retries on the next poll.
+
+        The restart counter is reset whenever ``ping()`` succeeds, so
+        a sidecar that crashes once but then runs stably doesn't
+        accumulate towards the budget.
+
+        FIX: On ``EADDRINUSE`` during restart (the OS reassigned the
+        port in the brief window between crash and restart), fall back
+        to port 0 (OS-assigned) and update ``_bound_port`` so
+        subsequent restarts use the new port.
+        """
         try:
             while not self._stopping:
                 await asyncio.sleep(5.0)
@@ -452,21 +580,24 @@ class SidecarManager:
 
                 if self._process and self._process.returncode is not None:
                     rc = self._process.returncode
-                    logger.warning("Sidecar exited unexpectedly (rc=%d)", rc)
-                    self._addr = None  # Immediately signal "unavailable"
+                    logger.warning(
+                        "Sidecar exited unexpectedly (rc=%d)", rc
+                    )
+                    self._addr = None
 
                     if self._restart_count >= self.max_restarts:
                         logger.error(
                             "Sidecar crashed %d times, giving up",
                             self._restart_count,
                         )
-                        self._addr = None
                         break
 
                     self._restart_count += 1
                     logger.info(
                         "Restarting sidecar (attempt %d/%d) in %.1fs...",
-                        self._restart_count, self.max_restarts, self.restart_delay,
+                        self._restart_count,
+                        self.max_restarts,
+                        self.restart_delay,
                     )
                     await asyncio.sleep(self.restart_delay)
 
@@ -478,26 +609,37 @@ class SidecarManager:
                         self._started_at = time.monotonic()
                         logger.info(
                             "Sidecar restarted on %s (pid=%d)",
-                            self._addr, self.pid,
+                            self._addr,
+                            self.pid,
                         )
                     except RuntimeError as e:
-                        logger.error("Sidecar restart failed: %s", e)
+                        err_msg = str(e)
+                        # If the port is taken, fall back to OS-assigned
+                        if "address already in use" in err_msg.lower():
+                            logger.warning(
+                                "Port %d in use, falling back to OS-assigned",
+                                self._bound_port or 0,
+                            )
+                            self._bound_port = 0
+                        else:
+                            logger.error("Sidecar restart failed: %s", e)
                     except asyncio.CancelledError:
-                        # stop() was called during restart — kill any
-                        # partially-started process and exit cleanly
+                        # stop() was called during restart — clean up
                         await self._kill_process()
                         raise
 
         except asyncio.CancelledError:
             pass
 
-    # -- context manager ---------------------------------------------------
+    # ── context manager ───────────────────────────────────────────────────
 
     async def __aenter__(self) -> SidecarManager:
+        """Start the sidecar on entering the ``async with`` block."""
         await self.start()
         return self
 
     async def __aexit__(self, *exc: object) -> None:
+        """Stop the sidecar on exiting the ``async with`` block."""
         await self.stop()
 
     def __repr__(self) -> str:
