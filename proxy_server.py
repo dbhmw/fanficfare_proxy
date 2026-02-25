@@ -2601,11 +2601,15 @@ class SessionProxy:
         port: int = 0,
         config: ProxyConfig = DEFAULT_CONFIG,
         sidecar: Optional[SidecarManager] = None,
+        log_level = logging.INFO
     ):
         self.host = host
         self.port = port
         self.config = config
         self.rule: Optional[Rule] = None
+
+        _handler.setLevel(log_level)
+        logger.setLevel(log_level)
 
         self._socks_pool = socks_pool
         # Explicit proxy takes precedence; otherwise auto-assign from pool
@@ -2930,10 +2934,7 @@ class ColoredFormatter(logging.Formatter):
 
 
 logger: CustomLogger = logging.getLogger(__name__)  # type: ignore[assignment]
-logger.setLevel(logging.DEBUG)
-
 _handler = logging.StreamHandler()
-_handler.setLevel(logging.DEBUG)
 _handler.setFormatter(
     ColoredFormatter(
         "%(elapsed)s | %(levelname)-8s | %(filename)s | %(funcName)s[%(lineno)d] | %(message)s"

@@ -1,4 +1,6 @@
-Certs/
+client_certs/
+server_certs/
+ca/
 .mypy_cache/
 global_cookies
 __pycache__/

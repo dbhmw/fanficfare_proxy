@@ -5,7 +5,7 @@ services:
     ports:
       - "23000:23000"
     volumes:
-      - ./Certs:/home/fff_proxy/certs:ro
+      - ./server_certs:/home/fff_proxy/server_certs:ro
     restart: on-failure
     tmpfs:
       - /tmp:rw,size=1g,mode=1777

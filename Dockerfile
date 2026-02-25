@@ -38,8 +38,8 @@ RUN pacman -Syu --noconfirm && \
 
 # Create non-root user
 RUN useradd -m -u 1000 fff_proxy && \
-    mkdir -p /home/fff_proxy/proxy /home/fff_proxy/chromium /home/fff_proxy/certs /home/fff_proxy/proxy/utls_bridge && \
-    chown -R fff_proxy:fff_proxy /home/fff_proxy/proxy /home/fff_proxy/chromium /home/fff_proxy/certs /home/fff_proxy/proxy/utls_bridge
+    mkdir -p /home/fff_proxy/proxy /home/fff_proxy/chromium /home/fff_proxy/server_certs /home/fff_proxy/proxy/utls_bridge && \
+    chown -R fff_proxy:fff_proxy /home/fff_proxy/proxy /home/fff_proxy/chromium /home/fff_proxy/server_certs /home/fff_proxy/proxy/utls_bridge
 
 # Switch to appuser early
 USER fff_proxy
@@ -64,7 +64,7 @@ COPY --chown=fff_proxy:fff_proxy --chmod=770 config.ini .
 COPY --chown=fff_proxy:fff_proxy --chmod=770 requirements.txt .
 
 # Download and install ungoogled-chromium
-ADD --chown=fff_proxy:fff_proxy --chmod=770 https://github.com/ungoogled-software/ungoogled-chromium-portablelinux/releases/download/145.0.7632.45-1/ungoogled-chromium-145.0.7632.45-1-x86_64_linux.tar.xz /tmp/chromium.tar.xz
+ADD --chown=fff_proxy:fff_proxy --chmod=770 https://github.com/ungoogled-software/ungoogled-chromium-portablelinux/releases/download/145.0.7632.109-1/ungoogled-chromium-145.0.7632.109-1-x86_64_linux.tar.xz /tmp/chromium.tar.xz
 RUN mkdir -p /home/fff_proxy/chromium && \
     tar -xf /tmp/chromium.tar.xz -C /home/fff_proxy/chromium --strip-components=1 && \
     rm /tmp/chromium.tar.xz
@@ -86,7 +86,7 @@ USER fff_proxy
 # Set entrypoint to activate venv and run main.py
 ENTRYPOINT ["/bin/bash", "-c", "source /home/fff_proxy/.venv/bin/activate && exec python driverless.py \"$@\"", "--"]
 CMD ["--chrome", "/home/fff_proxy/chromium/chrome", \
-     "--cert", "/home/fff_proxy/certs/server_crt.pem", \
-     "--key", "/home/fff_proxy/certs/server_key.pem", \
-     "--cacert", "/home/fff_proxy/certs/rootCA.pem", \
+     "--cert", "/home/fff_proxy/server_certs/server_cert.pem", \
+     "--key", "/home/fff_proxy/server_certs/server_key.pem", \
+     "--cacert", "/home/fff_proxy/server_certs/local_ca_cert.pem", \
      "--host", "0.0.0.0"]

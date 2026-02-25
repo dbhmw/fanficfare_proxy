@@ -145,6 +145,11 @@ class OutdatedUrlError(Exception):
     def __init__(self, message: str) -> None:
         super().__init__(message)
 
+class CustomLogger(logging.Logger):
+    def trace(self, message: object, *args: Any, stacklevel: int = 1, **kwargs: Any) -> None:
+        if self.isEnabledFor(5):
+            self._log(5, message, args, **kwargs, stacklevel=stacklevel + 1)
+
 class ColoredFormatter(logging.Formatter):
     RESET: str = "\033[0m"
     DEBUG: str = "\033[2;34m"
@@ -211,6 +216,18 @@ class Init:
         self.config: configparser.ConfigParser = configparser.ConfigParser()
         if os.path.exists(self.args.config):
             self.config.read(self.args.config)
+
+        self.log_lvl = logging.INFO
+        if self.args.debug:
+            logger.setLevel(logging.DEBUG)
+            ch.setLevel(logging.DEBUG)
+            self.log_lvl = logging.DEBUG
+        if self.args.trace:
+            logger.setLevel(5)
+            ch.setLevel(5)
+            self.log_lvl = 5
+        logger.setLevel(self.log_lvl)
+        ch.setLevel(self.log_lvl)
 
     def config_ini(self) -> None: # ConfigDict:
         self.port: int = (
@@ -508,8 +525,11 @@ class ProxyServer:
         request: ServerRequest = await self.decrypt(packet)
 
         try:
-            logger.debug("Client %s: Request for browser enqueued.", request["session"])
-            drivenbrowser_ref = await self.browsercontroller.get_session_browser(request["session"], request["image"])
+            if request["session"] == "None":
+                _drivenbrowser, drivenbrowser_ref = await self.browsercontroller.get_temp_browser(request["session"])
+            else:
+                logger.debug("Client %s: Request for browser enqueued.", request["session"])
+                drivenbrowser_ref = await self.browsercontroller.get_session_browser(request["session"])
         except Exception as e:
             logger.error(traceback.format_exc())
             logger.error("Failed to get browser")
@@ -518,8 +538,9 @@ class ProxyServer:
 
         try:
             heartbeat = asyncio.create_task(self.heartbeat(writer, request["heartbeat"]))
+            reqid = random.randint(-100000, 100000)
             try:
-                client = ClientRequest(self.stats, drivenbrowser_ref)
+                client = ClientRequest(self.stats, drivenbrowser_ref, reqid)
                 weakref.finalize(client, lambda: logger.debug("Garbage collected client"))
                 client_task = asyncio.create_task(client.main(request))
                 if drivenbrowser := drivenbrowser_ref():
@@ -533,15 +554,17 @@ class ProxyServer:
                 self.stats.add_failed(request["url"], str(e))
                 content['errors'] = traceback.format_exc()
             finally:
-                if drivenbrowser := drivenbrowser_ref():
+                drivenbrowser = drivenbrowser_ref()
+                if drivenbrowser == None:
+                    raise BaseException("State")
+                if request["session"] == "None":
+                    await drivenbrowser.terminate_session()
+                    del _drivenbrowser
+                else:
                     drivenbrowser.last_used = time.time()
                     drivenbrowser.in_use -= 1
-                    if client:
-                        logger.debug("Attemp at tab")
-                        await drivenbrowser.destroy_tab(client.requestid)
-                    else:
-                        logger.error("No clientn")
-                    del drivenbrowser
+                    await drivenbrowser.destroy_tab(reqid)
+                del drivenbrowser
                 if client:
                     await BrowserController._clear_frames(client)
                     del client
@@ -732,7 +755,6 @@ class BrowserController:
         self.sessions: dict[str, SessionData] = {}
         self.browser_lock: asyncio.Lock = asyncio.Lock()
         self.main_driver: webdriver.Chrome
-        self.debug_weakrefs: dict[str, weakref.ReferenceType] = {}
         self.fp_proxy: Optional[SidecarManager] = None
 
     @classmethod
@@ -827,7 +849,7 @@ class BrowserController:
         except Exception as e:
             logger.warning("Driver quit returned an error: [%s]", str(e))
 
-    async def get_session_browser(self, session: str, set_proxy: Literal["True", "False"]) -> weakref.ReferenceType[DrivenBrowser]:
+    async def get_session_browser(self, session: str) -> weakref.ReferenceType[DrivenBrowser]:
         async with self.browser_lock:
             try:
                 logger.debug(await self.main_driver.title)
@@ -836,13 +858,13 @@ class BrowserController:
                 await self.initialize_main_driver()
 
             if session in self.sessions:
-                logger.debug("Returning session %s %s", session, set_proxy)
+                logger.debug("Returning session %s", session)
                 if self.sessions[session]['DrivenBrowser'].current_id < 0:
                     await self.remove_session(session)
                     raise RuntimeError("Browser is shutting down.")
                 return weakref.ref(self.sessions[session]['DrivenBrowser'])
 
-            logger.debug("New session %s %s", session, set_proxy)
+            logger.debug("New session %s", session)
 
             drivenbrowser: DrivenBrowser = DrivenBrowser(weakref.ref(self.main_driver), self.config, session, weakref.ref(self.fp_proxy) if self.fp_proxy else None)
             await drivenbrowser.initialize_socks5()
@@ -854,14 +876,24 @@ class BrowserController:
             task: asyncio.Task[None] = asyncio.create_task(self.browser_auto_destruction(drivenbrowser_ref, timeout))
             task.add_done_callback(partial(self.stale_check_callback, session=session))
 
-            self.debug_weakrefs[session] = drivenbrowser_ref
-
             self.sessions[session] = {
                 'StaleCheck': task,
                 'DrivenBrowser': drivenbrowser}
             del drivenbrowser, task
 
             return drivenbrowser_ref
+
+    async def get_temp_browser(self, session: str) -> tuple[DrivenBrowser, weakref.ReferenceType[DrivenBrowser]]:
+        try:
+            logger.debug(await self.main_driver.title)
+        except ConnectionClosedError:
+            async with self.browser_lock:
+                await self.destroy_main_driver()
+                await self.initialize_main_driver()
+        logger.debug("Temp session")
+        drivenbrowser: DrivenBrowser = DrivenBrowser(weakref.ref(self.main_driver), self.config, session, weakref.ref(self.fp_proxy) if self.fp_proxy else None)
+        await drivenbrowser.initialize_socks5()
+        return drivenbrowser, weakref.ref(drivenbrowser)
 
     async def browser_auto_destruction(self, browser: weakref.ReferenceType[DrivenBrowser], timeout: int) -> None:
         while True:
@@ -1172,7 +1204,8 @@ class DrivenBrowser:
             ca_cert=self.config.mitm_ca_cert,
             ca_key=self.config.mitm_ca_key,
             config=ProxyConfig(connect_timeout=61.0, verify_ssl=self.config.verify_ssl),
-            sidecar = self.fp_proxy() if self.fp_proxy else None
+            sidecar = self.fp_proxy() if self.fp_proxy else None,
+            log_level=self.config.log_lvl
         )
 
         self._proxy_started = threading.Event()
@@ -1251,7 +1284,7 @@ class DrivenBrowser:
         future = asyncio.run_coroutine_threadsafe(
             self.socks_proxy_instance.close_all_handlers(), loop
         )
-        logger.debug("Awaiting close_all_handlers")
+        logger.trace("Awaiting close_all_handlers")
         try:
             await asyncio.wait_for(asyncio.wrap_future(future), timeout=10.0)
         except (Exception, asyncio.TimeoutError) as e:
@@ -1261,7 +1294,7 @@ class DrivenBrowser:
         future = asyncio.run_coroutine_threadsafe(
             self.socks_proxy_instance.stop(), loop
         )
-        logger.debug("Awaiting stop")
+        logger.trace("Awaiting stop")
         try:
             await asyncio.wrap_future(future)
         except Exception as e:
@@ -1362,12 +1395,12 @@ class DrivenBrowser:
         return None
 
 class ClientRequest:
-    def __init__(self, stats: Stats, drivenbrowser: weakref.ReferenceType[DrivenBrowser]) -> None:
+    def __init__(self, stats: Stats, drivenbrowser: weakref.ReferenceType[DrivenBrowser], requestid: int) -> None:
         self.stats: Stats = stats
         self.drivenbrowser: weakref.ReferenceType[DrivenBrowser] = drivenbrowser
         self.timeout: float = 60.0
         self.img_workaround: bool = False
-        self.requestid: int = random.randint(-100000, 100000)
+        self.requestid: int = requestid
         self.links: list[str] = []
         self.request_queue: asyncio.Queue[ChromeResponse]
 
@@ -1567,6 +1600,7 @@ class ClientRequest:
             params_dict: dict[str, str] = json.loads(params)
             encoded_params: str = urllib.parse.urlencode(params_dict)
         else:
+            logger.debug("Raw params will be inserted.")
             encoded_params = params
         headers['Referer'] = path
 
@@ -1856,13 +1890,13 @@ class ClientRequest:
 
         return {"code": result[0], "content_type": result[1], "cookies": out_cookies, "source": base64.b64encode(result[2]).decode(), "errors": result[3]}
 
+logging.setLoggerClass(CustomLogger)
+logging.addLevelName(5, "TRACE")
 # Set up logging
-logger: logging.Logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+logger: CustomLogger = logging.getLogger(__name__)
 # logger.propagate = False
 # Create console handler
 ch: logging.StreamHandler[TextIO] = logging.StreamHandler()
-ch.setLevel(logging.DEBUG)
 # Create formatter and add it to the handler
 formatter: ColoredFormatter = ColoredFormatter('%(elapsed)s | %(levelname)-8s | %(filename)s | %(funcName)s[%(lineno)d] | %(message)s')
 ch.setFormatter(formatter)
@@ -1871,6 +1905,9 @@ logger.addHandler(ch)
 
 parser = argparse.ArgumentParser(description="SeleniumServer")
 parser.add_argument('-c','--config', type=str, metavar='PATH', default='./config.ini', help="Path to config")
+parser.add_argument('-d','--debug', dest='debug', action='store_true', help='Show debug log')
+parser.add_argument('-t','--trace', dest='trace', action='store_true', help=argparse.SUPPRESS)
+
 parser.add_argument("--xvfb", dest='xvfb', action=argparse.BooleanOptionalAction, default=None, help="Enable or disable Xvfb")
 parser.add_argument('--host', dest='host', type=str, metavar='HOST', default=None, help='Host/IP to bind (default: localhost)')
 parser.add_argument('--port', dest='port', type=int, metavar='PORT', default=None, help='Port to listen on (default: 23000)')
@@ -1884,8 +1921,8 @@ parser.add_argument('--chrome', dest='chrome', type=str, metavar='PATH', help='P
 parser.add_argument('--ublock', dest='ublock', type=str, metavar='PATH', help='Path to extension file')
 parser.add_argument('--driver-timeout', dest='driver_timeout', type=int, metavar='SECONDS', default=None, help='Time in seconds to close Chrome after last request (default: 60)')
 
-parser.add_argument('--mitm-cert', dest='mitm_ca_key', type=str, metavar='PATH', help='Path to MITM cert')
-parser.add_argument('--mitm-key', dest='mitm_ca_cert', type=str, metavar='PATH', help='Path to MITM key')
+parser.add_argument('--mitm-cert', dest='mitm_ca_key', type=str, metavar='PATH', help=argparse.SUPPRESS)
+parser.add_argument('--mitm-key', dest='mitm_ca_cert', type=str, metavar='PATH', help=argparse.SUPPRESS)
 
 parser.add_argument('--impersonate', dest='impersonate', type=str, default='', help=argparse.SUPPRESS)
 parser.add_argument('--impersonate-port', dest='impersonate_port', type=int, metavar='PORT', help=argparse.SUPPRESS)
