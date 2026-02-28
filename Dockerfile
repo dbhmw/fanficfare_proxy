@@ -83,8 +83,8 @@ EXPOSE 23000
 # Stay as appuser for runtime
 USER fff_proxy
 
-# Set entrypoint to activate venv and run main.py
-ENTRYPOINT ["/bin/bash", "-c", "source /home/fff_proxy/.venv/bin/activate && exec python driverless.py \"$@\"", "--"]
+# Set entrypoint to activate venv and run
+ENTRYPOINT ["/bin/bash", "-c", "source /home/fff_proxy/.venv/bin/activate && exec python -OO driverless.py \"$@\"", "--"]
 CMD ["--chrome", "/home/fff_proxy/chromium/chrome", \
      "--cert", "/home/fff_proxy/server_certs/server_cert.pem", \
      "--key", "/home/fff_proxy/server_certs/server_key.pem", \

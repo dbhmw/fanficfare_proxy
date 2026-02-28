@@ -212,17 +212,16 @@ class Init:
         self.proxy_instance: ProxyServer
 
         self.in_progress: bool = False
-        self.args: argparse.Namespace = parser.parse_args()
         self.config: configparser.ConfigParser = configparser.ConfigParser()
-        if os.path.exists(self.args.config):
-            self.config.read(self.args.config)
+        if os.path.exists(args.config):
+            self.config.read(args.config)
 
         self.log_lvl = logging.INFO
-        if self.args.debug:
+        if args.debug:
             logger.setLevel(logging.DEBUG)
             ch.setLevel(logging.DEBUG)
             self.log_lvl = logging.DEBUG
-        if self.args.trace:
+        if args.trace:
             logger.setLevel(5)
             ch.setLevel(5)
             self.log_lvl = 5
@@ -231,28 +230,28 @@ class Init:
 
     def config_ini(self) -> None: # ConfigDict:
         self.port: int = (
-            self.args.port
-            if self.args.port is not None
+            args.port
+            if args.port is not None
             else self.config.getint("server", "port", fallback=23000)
         )
         self.host: str = (
-            self.args.host
-            if self.args.host is not None
+            args.host
+            if args.host is not None
             else self.config.get("server", "host", fallback='127.0.0.1')
         )
         self.chormium: Optional[str] = (
-            self.args.chrome
-            if self.args.chrome is not None
+            args.chrome
+            if args.chrome is not None
             else self.config.get("server", "chrome", fallback=None)
         )
         self.driver_timeout: int = (
-            self.args.driver_timeout
-            if self.args.driver_timeout is not None
+            args.driver_timeout
+            if args.driver_timeout is not None
             else self.config.getint("server", "driver_timeout", fallback=60)
         )
         self.virt_disp: bool = (
-            self.args.xvfb
-            if self.args.xvfb is not None
+            args.xvfb
+            if args.xvfb is not None
             else self.config.getboolean("server", "xvfb", fallback=True)
         )
         if self.virt_disp:
@@ -265,37 +264,37 @@ class Init:
             os.environ["XDG_SESSION_TYPE"] = "x11"
 
         self.cert: str = (
-            self.args.cert
-            if self.args.cert is not None
+            args.cert
+            if args.cert is not None
             else self.config.get("server", "cert")
         )
         self.key: str = (
-            self.args.key
-            if self.args.key is not None
+            args.key
+            if args.key is not None
             else self.config.get("server", "key")
         )
         self.clientcert: str = (
-            self.args.cacert
-            if self.args.cacert is not None
+            args.cacert
+            if args.cacert is not None
             else self.config.get("server", "cacert")
         )
         logger.debug((self.clientcert, self.key, self.cert))
 
         self.adblock: Optional[str] = (
-            self.args.ublock
-            if self.args.ublock is not None
+            args.ublock
+            if args.ublock is not None
             else self.config.get("server", "ublock", fallback=None)
         )
         self.extension: Optional[str] = self.config.get("server", "extension", fallback=None)
 
         self.socks5_file: str = (
-            self.args.socks5_file
-            if hasattr(self.args, 'socks5_file') and self.args.socks5_file is not None
+            args.socks5_file
+            if hasattr(args, 'socks5_file') and args.socks5_file is not None
             else self.config.get("server", "socks5_file", fallback='')
         )
         self.verify_ssl: bool = (
-            self.args.verify_ssl
-            if hasattr(self.args, 'verify_ssl')
+            args.verify_ssl
+            if hasattr(args, 'verify_ssl')
             else self.config.getboolean("server", "verify_ssl", fallback=True)
         )
         if not self.verify_ssl:
@@ -303,23 +302,23 @@ class Init:
         # For TLS interception, use dedicated CA cert/key
         # Generate these with: python3 generate_ca.py --output-dir ./certs
         self.mitm_ca_cert: str = (
-            self.args.mitm_ca_cert
-            if hasattr(self.args, 'mitm_ca_cert') and self.args.mitm_ca_cert is not None
+            args.mitm_ca_cert
+            if hasattr(args, 'mitm_ca_cert') and args.mitm_ca_cert is not None
             else self.config.get("server", "mitm_ca_cert", fallback=self.cert)
         )
         self.mitm_ca_key: str = (
-            self.args.mitm_ca_key
-            if hasattr(self.args, 'mitm_ca_key') and self.args.mitm_ca_key is not None
+            args.mitm_ca_key
+            if hasattr(args, 'mitm_ca_key') and args.mitm_ca_key is not None
             else self.config.get("server", "mitm_ca_key", fallback=self.key)
         )
         self.impersonate_chrome: str = (
-            self.args.impersonate_chrome
-            if hasattr(self.args, 'impersonate') and self.args.impersonate
+            args.impersonate_chrome
+            if hasattr(args, 'impersonate') and args.impersonate
             else self.config.get("server", "impersonate", fallback='')
         )
         self.impersonate_port: int = (
-            self.args.impersonate_port
-            if hasattr(self.args, 'impersonate_port') and self.args.impersonate_port
+            args.impersonate_port
+            if hasattr(args, 'impersonate_port') and args.impersonate_port
             else self.config.getint("server", "impersonate_port", fallback=0)
         )
 
@@ -1279,18 +1278,16 @@ class DrivenBrowser:
 
         logger.info("Stopping SOCKS5 proxy...")
         loop = self.socks_proxy_loop
-
-        # 1. Close all in-flight connections (clean GOAWAY for H2)
         future = asyncio.run_coroutine_threadsafe(
             self.socks_proxy_instance.close_all_handlers(), loop
         )
+
         logger.trace("Awaiting close_all_handlers")
         try:
             await asyncio.wait_for(asyncio.wrap_future(future), timeout=10.0)
         except (Exception, asyncio.TimeoutError) as e:
             logger.warning("close_all_handlers error: %s", e)
 
-        # 2. Stop accepting new connections
         future = asyncio.run_coroutine_threadsafe(
             self.socks_proxy_instance.stop(), loop
         )
@@ -1300,10 +1297,7 @@ class DrivenBrowser:
         except Exception as e:
             logger.warning("stop error: %s", e)
 
-        # 3. Stop the event loop (unblocks run_forever)
         loop.call_soon_threadsafe(loop.stop)
-
-        # 4. Wait for thread exit without blocking our loop
         if self.socks_proxy_thread and self.socks_proxy_thread.is_alive():
             await asyncio.get_running_loop().run_in_executor(
                 None, self.socks_proxy_thread.join, 5
@@ -1926,6 +1920,8 @@ parser.add_argument('--mitm-key', dest='mitm_ca_cert', type=str, metavar='PATH',
 
 parser.add_argument('--impersonate', dest='impersonate', type=str, default='', help=argparse.SUPPRESS)
 parser.add_argument('--impersonate-port', dest='impersonate_port', type=int, metavar='PORT', help=argparse.SUPPRESS)
+
+args: argparse.Namespace = parser.parse_args()
 
 handler = (lambda e: logger.debug(f'Event-handler: {e.__class__.__name__}: {str(e)}'))
 sys.modules["selenium_driverless"].EXC_HANDLER = handler # type: ignore

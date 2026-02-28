@@ -821,7 +821,7 @@ class SocksProxyPool:
                 self.proxy_file,
             )
         except FileNotFoundError:
-            logger.warning("SOCKS5 proxy file not found: %s", self.proxy_file)
+            logger.info("SOCKS5 proxy file not found: %s", self.proxy_file)
         except Exception as e:
             logger.error("Error loading SOCKS5 proxies: %s", e)
 
@@ -1563,7 +1563,7 @@ class Http2Handler:
                 exc = t.exception()
                 if isinstance(exc, (_TargetGoaway, _ClientGoaway)):
                     goaway = True
-                    logger.info(
+                    logger.debug(
                         "[HTTP/2 %s] GOAWAY teardown: %s",
                         target_host,
                         exc,
@@ -1585,7 +1585,7 @@ class Http2Handler:
                 )
                 await client.close()
                 await target.close()
-                logger.info(
+                logger.debug(
                     "[HTTP/2 %s] Handler destroyed after GOAWAY", target_host
                 )
 
@@ -1917,7 +1917,7 @@ class Http2Handler:
             last_id = getattr(event, "last_stream_id", None)
             error_code = getattr(event, "error_code", 0)
             additional = getattr(event, "additional_data", b"")
-            logger.info(
+            logger.debug(
                 "[GOAWAY] Client sent GOAWAY (last_stream=%s, error=%s, data=%s) — "
                 "tearing down handler (%d active streams)",
                 last_id,
@@ -2046,7 +2046,7 @@ class Http2Handler:
             last_id = getattr(event, "last_stream_id", None)
             error_code = getattr(event, "error_code", 0)
             additional = getattr(event, "additional_data", b"")
-            logger.info(
+            logger.debug(
                 "[GOAWAY] Target sent GOAWAY (last_stream=%s, error=%s, data=%s) — "
                 "tearing down handler (%d active streams)",
                 last_id,
