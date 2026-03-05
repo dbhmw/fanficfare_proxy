@@ -60,6 +60,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/url"
 	"os"
 	"os/signal"
 	"runtime"
@@ -87,6 +88,7 @@ type Config struct {
 	BufferSize     int           // size of the copy buffer (bytes)
 	MaxConns       int64         // 0 = unlimited concurrent connections
 	Insecure       bool          // skip TLS certificate verification
+	ShutdownCh     <-chan struct{} // closed on SIGTERM/SIGINT to interrupt active pipes
 }
 
 // ---------------------------------------------------------------------------
@@ -355,9 +357,7 @@ func chromeHandshake(ctx context.Context, conn net.Conn, hostname string, insecu
 // maxCommandLineLen caps the maximum length of a command line to
 // prevent a malicious client from forcing unbounded memory allocation.
 // ReadSlice will return bufio.ErrBufferFull if the line exceeds the
-// buffer size; we use a slightly larger buffer here so legitimate
-// CONNECT commands (which include a hostname and optional SOCKS URL)
-// always fit.
+// buffer size.
 const maxCommandLineLen = 65536
 
 // handleConn reads a single command from the local connection and
@@ -371,26 +371,19 @@ func handleConn(conn net.Conn, cfg Config) {
 	// allocation from a malicious or misbehaving client.
 	conn.SetReadDeadline(time.Now().Add(cfg.ReadTimeout))
 	reader := bufio.NewReaderSize(conn, maxCommandLineLen)
-	line, err := reader.ReadString('\n')
+	lineBytes, err := reader.ReadSlice('\n')
 	if err != nil {
-		// If the line is too long, ReadString will still return what
-		// it has plus the error — we just reject it.
+		// ErrBufferFull means line exceeded maxCommandLineLen — reject.
+		// Any other error (EOF, timeout) also means we can't proceed.
+		if errors.Is(err, bufio.ErrBufferFull) {
+			writeResp(conn, cfg, "ERR command line too long\n")
+		}
 		conn.Close()
 		return
 	}
 	conn.SetReadDeadline(time.Time{})
 
-	// FIX: Enforce a hard length limit.  bufio.ReadString will
-	// allocate beyond the buffer size if no newline is found within
-	// the buffer.  This prevents a client from sending megabytes of
-	// data without a newline.
-	if len(line) > maxCommandLineLen {
-		writeResp(conn, cfg, "ERR command line too long\n")
-		conn.Close()
-		return
-	}
-
-	line = strings.TrimSpace(line)
+	line := strings.TrimSpace(string(lineBytes))
 	fields := strings.Fields(line)
 	if len(fields) == 0 {
 		conn.Close()
@@ -398,28 +391,101 @@ func handleConn(conn net.Conn, cfg Config) {
 	}
 
 	switch strings.ToUpper(fields[0]) {
-		case "PING":
-			writeResp(conn, cfg, "PONG\n")
-			conn.Close()
+	case "PING":
+		writeResp(conn, cfg, "PONG\n")
+		conn.Close()
 
-		case "STATS":
-			data, _ := json.Marshal(metrics.Snapshot())
-			writeResp(conn, cfg, string(data)+"\n")
-			conn.Close()
+	case "STATS":
+		data, _ := json.Marshal(metrics.Snapshot())
+		writeResp(conn, cfg, string(data)+"\n")
+		conn.Close()
 
-		case "CONNECT":
-			// Only CONNECT increments metrics — PING/STATS are control
-			// plane and shouldn't inflate the connection counters.
-			metrics.ActiveConns.Add(1)
-			metrics.TotalConns.Add(1)
-			doConnect(conn, reader, fields, cfg)
-			// doConnect closes conn via pipe() or on error path
-			metrics.ActiveConns.Add(-1)
+	case "CONNECT":
+		// Only CONNECT increments metrics — PING/STATS are control
+		// plane and shouldn't inflate the connection counters.
+		metrics.ActiveConns.Add(1)
+		metrics.TotalConns.Add(1)
+		doConnect(conn, reader, fields, cfg)
+		// doConnect closes conn via pipe() or on error path
+		metrics.ActiveConns.Add(-1)
 
-		default:
-			writeResp(conn, cfg, fmt.Sprintf("ERR unknown command: %s\n", fields[0]))
-			conn.Close()
+	default:
+		writeResp(conn, cfg, fmt.Sprintf("ERR unknown command: %s\n", fields[0]))
+		conn.Close()
 	}
+}
+
+// parseTarget parses a CONNECT target into host and numeric port.
+// It handles plain hosts, host:port, and bracketed IPv6 addresses.
+// Returns an error if the port is invalid rather than falling through
+// silently to a default.
+func parseTarget(target string) (host string, port int, err error) {
+	if strings.HasPrefix(target, "[") {
+		h, p, splitErr := net.SplitHostPort(target)
+		if splitErr != nil {
+			// Could be "[::1]" without a port — try stripping brackets
+			if strings.HasSuffix(target, "]") {
+				host = target[1 : len(target)-1]
+				if host == "" {
+					return "", 0, fmt.Errorf("empty hostname in target %q", target)
+				}
+				return host, 443, nil
+			}
+			return "", 0, fmt.Errorf("invalid target %q: %w", target, splitErr)
+		}
+		host = h
+		if host == "" {
+			return "", 0, fmt.Errorf("empty hostname in target %q", target)
+		}
+		port, err = net.LookupPort("tcp", p)
+		if err != nil {
+			return "", 0, fmt.Errorf("invalid port %q: %w", p, err)
+		}
+		return host, port, nil
+	}
+
+	h, p, splitErr := net.SplitHostPort(target)
+	if splitErr != nil {
+		// No port specified — default to 443 (HTTPS)
+		return target, 443, nil
+	}
+	host = h
+
+	if host == "" {
+		return "", 0, fmt.Errorf("empty hostname in target %q", target)
+	}
+
+	port, err = net.LookupPort("tcp", p)
+	if err != nil {
+		return "", 0, fmt.Errorf("invalid port %q: %w", p, err)
+	}
+	return host, port, nil
+}
+
+// parseSOCKS5Proxy parses a SOCKS5 proxy URL string into a host:port
+// address.  Supports "socks5://host:port" and "socks://host:port".
+// Returns an error for malformed URLs or URLs containing userinfo
+// (authentication is not supported).
+func parseSOCKS5Proxy(raw string) (string, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "", fmt.Errorf("invalid proxy URL %q: %w", raw, err)
+	}
+	if u.Scheme != "socks5" && u.Scheme != "socks" {
+		return "", fmt.Errorf("unsupported proxy scheme %q (want socks5)", u.Scheme)
+	}
+	if u.User != nil {
+		return "", fmt.Errorf("socks5 authentication not supported")
+	}
+	hostport := u.Host
+	if hostport == "" {
+		return "", fmt.Errorf("proxy URL %q has no host", raw)
+	}
+	// Ensure we have a port
+	if _, _, err := net.SplitHostPort(hostport); err != nil {
+		return "", fmt.Errorf("proxy URL %q missing port: %w", raw, err)
+	}
+	return hostport, nil
 }
 
 // doConnect handles the CONNECT command:
@@ -429,35 +495,39 @@ func handleConn(conn net.Conn, cfg Config) {
 //  4. Report negotiated ALPN to the Python side
 //  5. Enter bidirectional plaintext pipe
 func doConnect(conn net.Conn, reader *bufio.Reader, fields []string, cfg Config) {
+	connOpen := true
+	defer func() {
+		if connOpen {
+			conn.Close()
+		}
+	}()
+
 	if len(fields) < 2 {
 		writeResp(conn, cfg, "ERR CONNECT requires host:port\n")
-		conn.Close()
 		return
 	}
 
 	target := fields[1]
-	host, portStr, err := net.SplitHostPort(target)
-	if err != nil {
-		// No port specified — default to 443 (HTTPS)
-		host = target
-		portStr = "443"
-	}
-	port := 443
-	if p, err := net.LookupPort("tcp", portStr); err == nil {
-		port = p
-	}
 
-	// Optional SOCKS5 proxy: "CONNECT host:port socks5://proxy:port"
+	host, port, err := parseTarget(target)
+	if err != nil {
+		writeResp(conn, cfg, fmt.Sprintf("ERR %s\n", err))
+		return
+	}
+	portStr := fmt.Sprintf("%d", port)
+
 	var socksProxy string
 	if len(fields) >= 3 {
-		socksProxy = strings.TrimPrefix(fields[2], "socks5://")
-		socksProxy = strings.TrimPrefix(socksProxy, "socks://")
+		socksProxy, err = parseSOCKS5Proxy(fields[2])
+		if err != nil {
+			writeResp(conn, cfg, fmt.Sprintf("ERR %s\n", err))
+			return
+		}
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.ConnectTimeout)
 	defer cancel()
 
-	// --- TCP connection (direct or SOCKS5) ---
 	var targetConn net.Conn
 	if socksProxy != "" {
 		targetConn, err = dialSOCKS5(ctx, socksProxy, host, port)
@@ -466,7 +536,6 @@ func doConnect(conn net.Conn, reader *bufio.Reader, fields []string, cfg Config)
 	}
 	if err != nil {
 		writeResp(conn, cfg, fmt.Sprintf("ERR %s\n", err))
-		conn.Close()
 		return
 	}
 
@@ -476,15 +545,20 @@ func doConnect(conn net.Conn, reader *bufio.Reader, fields []string, cfg Config)
 	tlsConn, alpn, err := chromeHandshake(ctx, targetConn, host, cfg.Insecure)
 	if err != nil {
 		writeResp(conn, cfg, fmt.Sprintf("ERR %s\n", err))
-		conn.Close()
 		return
 	}
 
+	// From here on, tlsConn is open and must be cleaned up on error.
+	tlsOpen := true
+	defer func() {
+		if tlsOpen {
+			tlsConn.Close()
+		}
+	}()
+
 	// --- Report success + negotiated protocol ---
 	if err := writeResp(conn, cfg, fmt.Sprintf("OK %s\n", alpn)); err != nil {
-		tlsConn.Close()
-		conn.Close()
-		return
+		return // defers close both
 	}
 
 	// --- Flush buffered data ---
@@ -497,14 +571,14 @@ func doConnect(conn net.Conn, reader *bufio.Reader, fields []string, cfg Config)
 		n, _ := reader.Read(buf)
 		if n > 0 {
 			if _, err := tlsConn.Write(buf[:n]); err != nil {
-				tlsConn.Close()
-				conn.Close()
-				return
+				return // defers close both
 			}
 		}
 	}
 
-	// pipe() closes both connections when done.
+	// pipe() closes both connections when done — mark as transferred.
+	connOpen = false
+	tlsOpen = false
 	pipe(conn, tlsConn, cfg)
 }
 
@@ -571,17 +645,37 @@ func pipe(client, target net.Conn, cfg Config) {
 		}
 		// Signal teardown (non-blocking — first writer wins).
 		select {
-			case teardown <- struct{}{}:
-			default:
+		case teardown <- struct{}{}:
+		default:
 		}
 	}
 
 	go cp(target, client) // client → target
 	go cp(client, target) // target → client
 
-	// Wait for the first direction to finish, then close both to
-	// unblock the other.
-	<-teardown
+	// Wait for the first direction to finish OR a shutdown signal.
+	// On shutdown, closing the connections unblocks the cp goroutines'
+	// Read calls, allowing them to exit and the drain to complete
+	// within the 5s deadline.
+	select {
+	case <-teardown:
+		// Normal path — one direction finished.
+	case <-cfg.ShutdownCh:
+		// Shutdown requested — break out of the pipe immediately.
+		log.Printf("[INFO] shutdown: closing active pipe")
+	}
+
+	// Use TCP half-close where available to avoid racing
+	// Close() with an in-flight Write().  CloseWrite signals EOF to
+	// the peer's Read without aborting an in-flight Write on our side.
+	if tc, ok := client.(*net.TCPConn); ok {
+		tc.CloseWrite()
+	}
+	if tc, ok := target.(interface{ CloseWrite() error }); ok {
+		tc.CloseWrite()
+	}
+
+	// Now fully close both connections.
 	client.Close()
 	target.Close()
 
@@ -596,10 +690,10 @@ func pipe(client, target net.Conn, cfg Config) {
 		close(done)
 	}()
 	select {
-		case <-done:
-			// Clean exit
-		case <-time.After(10 * time.Second):
-			log.Printf("[WARN] pipe goroutine drain timed out (10s)")
+	case <-done:
+		// Clean exit
+	case <-time.After(10 * time.Second):
+		log.Printf("[WARN] pipe goroutine drain timed out (10s)")
 	}
 }
 
@@ -614,15 +708,35 @@ func statsLoop(ctx context.Context, interval time.Duration) {
 	defer t.Stop()
 	for {
 		select {
-			case <-ctx.Done():
-				return
-			case <-t.C:
-				s := metrics.Snapshot()
-				log.Printf("[STATS] active=%d total=%d tls=%d tls_err=%d socks=%d bytes=%d gr=%d",
-					   s.ActiveConns, s.TotalConns, s.TLSHandshakes, s.TLSErrors,
-	       s.SOCKSConns, s.TotalBytes, s.Goroutines)
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			s := metrics.Snapshot()
+			// FIX #11: Consistent formatting (tabs vs spaces fixed).
+			log.Printf("[STATS] active=%d total=%d tls=%d tls_err=%d socks=%d bytes=%d gr=%d",
+				s.ActiveConns, s.TotalConns, s.TLSHandshakes, s.TLSErrors,
+				s.SOCKSConns, s.TotalBytes, s.Goroutines)
 		}
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Loopback enforcement
+// ---------------------------------------------------------------------------
+
+// isLoopback returns true if the given address string refers to a
+// loopback interface (127.0.0.0/8 or ::1).
+func isLoopback(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	// Handle "" or "0.0.0.0" or "::" — these bind all interfaces.
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		return false
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // ---------------------------------------------------------------------------
@@ -640,6 +754,10 @@ func main() {
 	insecure := flag.Bool("insecure", false, "Skip TLS certificate verification (development only)")
 	flag.Parse()
 
+	// Shutdown channel — closed when SIGTERM/SIGINT is received.
+	// Passed to pipe() via Config so active sessions can be interrupted.
+	shutdownCh := make(chan struct{})
+
 	cfg := Config{
 		ListenAddr:     *addr,
 		ReadTimeout:    5 * time.Second,
@@ -649,6 +767,17 @@ func main() {
 		BufferSize:     *bufSize,
 		MaxConns:       *maxConns,
 		Insecure:       *insecure,
+		ShutdownCh:     shutdownCh,
+	}
+
+	if cfg.Insecure {
+		log.Println("[WARN] *** TLS CERTIFICATE VERIFICATION DISABLED (--insecure) ***")
+	}
+
+	if !isLoopback(cfg.ListenAddr) {
+		log.Println("[WARN] *** Listening on non-loopback address! ***")
+		log.Printf("[WARN] *** %s is reachable from the network — this sidecar could be used as an open proxy. ***", cfg.ListenAddr)
+		log.Println("[WARN] *** Bind to 127.0.0.1 or ::1 unless you have a specific reason not to. ***")
 	}
 
 	// --- Start listener ---
@@ -676,12 +805,18 @@ func main() {
 	go func() {
 		<-ctx.Done()
 		log.Println("Shutting down...")
-		ln.Close() // causes Accept() to return an error
+		close(shutdownCh) // interrupt active pipe sessions (FIX #9)
+		ln.Close()        // causes Accept() to return an error
 	}()
 
 	// --- Background stats logging ---
 	if *statsInterval > 0 {
 		go statsLoop(ctx, *statsInterval)
+	}
+
+	var connSem chan struct{}
+	if cfg.MaxConns > 0 {
+		connSem = make(chan struct{}, cfg.MaxConns)
 	}
 
 	// --- Accept loop ---
@@ -694,12 +829,24 @@ func main() {
 			log.Printf("[ERR] accept: %v", err)
 			continue
 		}
-		if cfg.MaxConns > 0 && metrics.ActiveConns.Load() >= cfg.MaxConns {
-			writeResp(conn, cfg, "ERR max connections reached\n")
-			conn.Close()
-			continue
+
+		if connSem != nil {
+			// Non-blocking acquire: reject immediately if at capacity.
+			select {
+			case connSem <- struct{}{}:
+				// Acquired — will be released when handleConn returns.
+			default:
+				writeResp(conn, cfg, "ERR max connections reached\n")
+				conn.Close()
+				continue
+			}
+			go func() {
+				defer func() { <-connSem }() // release semaphore slot
+				handleConn(conn, cfg)
+			}()
+		} else {
+			go handleConn(conn, cfg)
 		}
-		go handleConn(conn, cfg)
 	}
 
 	// --- Drain active connections ---
@@ -707,10 +854,10 @@ func main() {
 	deadline := time.After(5 * time.Second)
 	for metrics.ActiveConns.Load() > 0 {
 		select {
-			case <-deadline:
-				log.Printf("Force exit with %d active connections", metrics.ActiveConns.Load())
-				return
-			case <-time.After(100 * time.Millisecond):
+		case <-deadline:
+			log.Printf("Force exit with %d active connections", metrics.ActiveConns.Load())
+			return
+		case <-time.After(100 * time.Millisecond):
 		}
 	}
 	log.Println("Clean shutdown")
