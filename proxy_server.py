@@ -112,7 +112,7 @@ class ProxyConfig:
     verify_ssl: bool = True
 
     connect_timeout: float = 120.0
-    idle_timeout: float = 70.0
+    idle_timeout: float = 55.0
     request_timeout: float = 120.0
     stream_timeout: float = 120.0
 
@@ -2601,15 +2601,11 @@ class SessionProxy:
         port: int = 0,
         config: ProxyConfig = DEFAULT_CONFIG,
         sidecar: Optional[SidecarManager] = None,
-        log_level = logging.INFO
     ):
         self.host = host
         self.port = port
         self.config = config
         self.rule: Optional[Rule] = None
-
-        _handler.setLevel(log_level)
-        logger.setLevel(log_level)
 
         self._socks_pool = socks_pool
         # Explicit proxy takes precedence; otherwise auto-assign from pool
@@ -2652,30 +2648,6 @@ class SessionProxy:
             self.port,
             reuse_address=True,
         )
-        # Suppress noisy asyncio SSL exceptions that occur when the browser
-        # resets a connection before the TLS shutdown completes.
-        loop = asyncio.get_running_loop()
-        _default_handler = loop.get_exception_handler()
-
-        def _quiet_exception_handler(
-            loop: asyncio.AbstractEventLoop, context: dict
-        ) -> None:
-            msg = context.get("message", "")
-            exc = context.get("exception")
-
-            if exc and "SSL" in type(exc).__name__:
-                logger.debug("asyncio SSL exception (suppressed): %s", exc)
-                return
-            if isinstance(msg, str) and "ssl" in msg.lower():
-                logger.debug("asyncio SSL message (suppressed): %s", msg)
-                return
-
-            if _default_handler:
-                _default_handler(loop, context)
-            else:
-                loop.default_exception_handler(context)
-
-        loop.set_exception_handler(_quiet_exception_handler)
 
         sock = self._server.sockets[0]
         self.port = sock.getsockname()[1]
@@ -2905,16 +2877,18 @@ class SessionProxy:
 # Logging
 # ============================================================================
 
+def set_proxy_log_level(level: int) -> None:
+    """Set the log level for the proxy module. Call once from your main script."""
+    _handler.setLevel(level)
+    logger.setLevel(level)
 
 class CustomLogger(logging.Logger):
     def trace(self, message: object, *args: Any, stacklevel: int = 1, **kwargs: Any) -> None:
         if self.isEnabledFor(5):
             self._log(5, message, args, **kwargs, stacklevel=stacklevel + 1)
 
-
 logging.setLoggerClass(CustomLogger)
 logging.addLevelName(5, "TRACE")
-
 
 class ColoredFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
@@ -2941,3 +2915,7 @@ _handler.setFormatter(
     )
 )
 logger.addHandler(_handler)
+
+_asyncio_logger = logging.getLogger("asyncio")
+_asyncio_logger.addHandler(_handler)
+_asyncio_logger.propagate = False

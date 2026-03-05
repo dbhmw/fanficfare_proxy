@@ -3,7 +3,7 @@ import uvloop
 uvloop.install()
 import patch_func
 from utls_bridge.sidecar import SidecarManager
-from proxy_server import SessionProxy, SocksProxyPool, ProxyConfig
+from proxy_server import SessionProxy, SocksProxyPool, ProxyConfig, set_proxy_log_level
 
 from typing import Optional, Literal, Any, TypedDict, TextIO, cast
 import asyncio, zlib, argparse, configparser, sys, signal, logging
@@ -218,15 +218,12 @@ class Init:
 
         self.log_lvl = logging.INFO
         if args.debug:
-            logger.setLevel(logging.DEBUG)
-            ch.setLevel(logging.DEBUG)
             self.log_lvl = logging.DEBUG
         if args.trace:
-            logger.setLevel(5)
-            ch.setLevel(5)
             self.log_lvl = 5
         logger.setLevel(self.log_lvl)
         ch.setLevel(self.log_lvl)
+        set_proxy_log_level(self.log_lvl)
 
     def config_ini(self) -> None: # ConfigDict:
         self.port: int = (
@@ -1204,7 +1201,6 @@ class DrivenBrowser:
             ca_key=self.config.mitm_ca_key,
             config=ProxyConfig(connect_timeout=61.0, verify_ssl=self.config.verify_ssl),
             sidecar = self.fp_proxy() if self.fp_proxy else None,
-            log_level=self.config.log_lvl
         )
 
         self._proxy_started = threading.Event()
@@ -1743,7 +1739,7 @@ class ClientRequest:
 
             req: Optional[asyncio.Task[dict[str, Any]]] = None
             try:
-                logger.debug("URL: %s | Referer: %s", self.links[0], str(referer))
+                logger.info("URL: %s | Referer: %s", self.links[0], str(referer))
                 await tab.execute_cdp_cmd("Network.clearBrowserCache")
                 async with self.drivenbrowser().intercept_urls(self.links) as cap:
                     req = asyncio.create_task(tab.get(self.links[0], referrer=referer, wait_load=False, timeout=self.timeout))
@@ -1779,10 +1775,11 @@ class ClientRequest:
                 if image == "True":
                     await self.drivenbrowser().remove_intercept_rule()
 
+            logger.info("Page returned: '%s'", str(status_code))
             if status_code in [301, 302, 303, 307, 308] and response_headers:
                 old = self.links[0]
                 for header in response_headers:
-                    if header[0] == 'location':
+                    if header[0].lower() == 'location':
                         url = header[1]
                         redirects += 1
                         logger.debug("Redirect [%s]", url)
@@ -1801,7 +1798,6 @@ class ClientRequest:
                 status_code = -1
                 return (status_code, "None", b"None", f"Could not get a full response ({headers})")
 
-            logger.info("Page returned: '%s'", str(status_code))
             break
 
         if image == "True":
@@ -1887,7 +1883,7 @@ class ClientRequest:
 logging.setLoggerClass(CustomLogger)
 logging.addLevelName(5, "TRACE")
 # Set up logging
-logger: CustomLogger = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 # logger.propagate = False
 # Create console handler
 ch: logging.StreamHandler[TextIO] = logging.StreamHandler()

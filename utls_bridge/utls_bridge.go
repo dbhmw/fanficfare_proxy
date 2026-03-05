@@ -90,6 +90,48 @@ type Config struct {
 }
 
 // ---------------------------------------------------------------------------
+// Buffer pool — avoids per-connection heap allocation under load
+// ---------------------------------------------------------------------------
+
+// bufPool recycles copy buffers used by the bidirectional pipe.
+//
+// Each CONNECT session needs two buffers (one per direction), each
+// cfg.BufferSize bytes (default 64 KB).  Under high concurrency
+// (hundreds of active connections) the allocation pressure is
+// significant: 200 connections × 2 × 64 KB = 25 MB of short-lived
+// buffers that churn through the GC.
+//
+// sync.Pool amortises this by reusing buffers across connections.
+// The pool is lazily sized: it starts empty and grows as connections
+// arrive, then shrinks naturally as the GC reclaims idle entries.
+//
+// We store *[]byte (pointer to slice) because sync.Pool works best
+// with pointer types — storing a bare []byte would cause an allocation
+// for the interface conversion on every Put.
+var bufPool sync.Pool
+
+// getBuf returns a buffer of at least `size` bytes from the pool,
+// allocating a new one if the pool is empty or the pooled buffer is
+// too small.
+func getBuf(size int) *[]byte {
+	if v := bufPool.Get(); v != nil {
+		bp := v.(*[]byte)
+		if cap(*bp) >= size {
+			*bp = (*bp)[:size]
+			return bp
+		}
+		// Pooled buffer is too small (config changed?), discard it
+	}
+	buf := make([]byte, size)
+	return &buf
+}
+
+// putBuf returns a buffer to the pool for reuse.
+func putBuf(bp *[]byte) {
+	bufPool.Put(bp)
+}
+
+// ---------------------------------------------------------------------------
 // Metrics — lock-free counters for operational visibility
 // ---------------------------------------------------------------------------
 
@@ -482,6 +524,12 @@ func writeResp(conn net.Conn, cfg Config, msg string) error {
 // pipe copies data between client (Python proxy) and target (TLS to
 // origin) in both directions concurrently.
 //
+// Buffers are obtained from a sync.Pool to avoid per-connection heap
+// allocation.  Under steady-state load (e.g. 200 concurrent
+// connections), the pool recycles buffers and the allocator is never
+// hit.  During ramp-up, fresh buffers are allocated and added to the
+// pool as connections close.
+//
 // When either direction encounters an error or EOF:
 //  1. It signals the teardown channel
 //  2. The main goroutine closes BOTH connections
@@ -498,7 +546,11 @@ func pipe(client, target net.Conn, cfg Config) {
 
 	cp := func(dst, src net.Conn) {
 		defer wg.Done()
-		buf := make([]byte, cfg.BufferSize)
+
+		bp := getBuf(cfg.BufferSize)
+		defer putBuf(bp)
+		buf := *bp
+
 		for {
 			// Per-read idle timeout: if no data arrives within
 			// IdleTimeout, the connection is considered stale.
