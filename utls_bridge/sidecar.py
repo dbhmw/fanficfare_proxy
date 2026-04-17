@@ -49,6 +49,8 @@ import json
 import logging
 import signal
 import time
+import os
+import socket as _socket
 from dataclasses import dataclass
 from typing import Optional
 
@@ -141,8 +143,7 @@ class SidecarManager:
     def __init__(
         self,
         binary_path: str,
-        listen_host: str = "127.0.0.1",
-        listen_port: int = 0,
+        socket_name: Optional[str] = None,
         connect_timeout: float = 30.0,
         idle_timeout: float = 90.0,
         stats_interval: float = 60.0,
@@ -155,8 +156,9 @@ class SidecarManager:
         verify_ssl: bool = True,
     ):
         self.binary_path = binary_path
-        self.listen_host = listen_host
-        self.listen_port = listen_port
+        if socket_name is None:
+            socket_name = f"tls-sidecar-{os.getpid()}"
+        self.socket_name = socket_name
         self.connect_timeout = connect_timeout
         self.idle_timeout = idle_timeout
         self.stats_interval = stats_interval
@@ -171,7 +173,7 @@ class SidecarManager:
         # ── Runtime state ──
         self._process: Optional[asyncio.subprocess.Process] = None
         self._addr: Optional[str] = None
-        self._bound_port: Optional[int] = None  # remembered for stable restarts
+        self._bound_name: Optional[str] = None  # remembered for restart
         self._monitor_task: Optional[asyncio.Task] = None
         self._io_tasks: list[asyncio.Task] = []  # stdout/stderr forwarders
         self._stopping = False
@@ -231,8 +233,7 @@ class SidecarManager:
         # Remember the port so restarts bind to the same address.
         # This means SessionProxy instances don't need to be
         # reconfigured after a sidecar crash + restart.
-        _, port_str = self._addr.rsplit(":", 1)
-        self._bound_port = int(port_str)
+        self._bound_name = self._addr.lstrip("@") if self._addr else self.socket_name
 
         # Start background monitor for auto-restart
         if self.auto_restart:
@@ -331,11 +332,7 @@ class SidecarManager:
         if not self._addr:
             return False
         try:
-            host, port_str = self._addr.rsplit(":", 1)
-            reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(host, int(port_str)),
-                timeout=timeout,
-            )
+            reader, writer = await self._connect(timeout)
             try:
                 writer.write(b"PING\n")
                 await writer.drain()
@@ -344,7 +341,7 @@ class SidecarManager:
                 )
                 ok = resp.strip() == b"PONG"
                 if ok:
-                    self._restart_count = 0  # healthy → reset counter
+                    self._restart_count = 0
                 return ok
             finally:
                 writer.close()
@@ -367,11 +364,7 @@ class SidecarManager:
         if not self._addr:
             return None
         try:
-            host, port_str = self._addr.rsplit(":", 1)
-            reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(host, int(port_str)),
-                timeout=timeout,
-            )
+            reader, writer = await self._connect(timeout)
             try:
                 writer.write(b"STATS\n")
                 await writer.drain()
@@ -379,8 +372,6 @@ class SidecarManager:
                     reader.readline(), timeout=timeout
                 )
                 data = json.loads(resp.decode("utf-8").strip())
-                # Filter to known fields so new Go-side fields don't
-                # break the dataclass constructor.
                 filtered = {k: v for k, v in data.items() if k in _STATS_FIELDS}
                 return SidecarStats(**filtered)
             finally:
@@ -402,10 +393,10 @@ class SidecarManager:
         and existing ``SessionProxy`` instances keep working without
         reconfiguration.
         """
-        port = self._bound_port if self._bound_port is not None else self.listen_port
+        name = self._bound_name or self.socket_name
         args = [
             self.binary_path,
-            "--listen", f"{self.listen_host}:{port}",
+            "--listen", name,
             "--connect-timeout", f"{self.connect_timeout}s",
             "--idle-timeout", f"{self.idle_timeout}s",
             "--stats-interval", f"{self.stats_interval}s",
@@ -500,6 +491,23 @@ class SidecarManager:
 
             # Unexpected pre-READY output — log and continue waiting
             logger.debug("[sidecar:stdout] %s", decoded)
+
+    async def _connect(self, timeout: float = 5.0) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        """Open a connection to the sidecar via abstract namespace UDS."""
+        if not self._addr:
+            raise ConnectionError("Sidecar address not set")
+        sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        try:
+            sock.connect(b"\x00" + self._addr.lstrip("@").encode("ascii"))
+            sock.setblocking(False)
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(sock=sock), timeout=timeout
+            )
+        except Exception:
+            sock.close()
+            raise
+
+        return reader, writer
 
     async def _forward_stdout(self) -> None:
         """Forward remaining sidecar stdout to the Python logger."""
@@ -616,11 +624,12 @@ class SidecarManager:
                         err_msg = str(e)
                         # If the port is taken, fall back to OS-assigned
                         if "address already in use" in err_msg.lower():
+                            new_name = f"{self.socket_name}-{int(time.monotonic())}"
                             logger.warning(
-                                "Port %d in use, falling back to OS-assigned",
-                                self._bound_port or 0,
+                                "Socket %s in use, retrying as %s",
+                                self._bound_name, new_name,
                             )
-                            self._bound_port = 0
+                            self._bound_name = new_name
                         else:
                             logger.error("Sidecar restart failed: %s", e)
                     except asyncio.CancelledError:

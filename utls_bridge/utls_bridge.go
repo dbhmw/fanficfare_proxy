@@ -721,31 +721,12 @@ func statsLoop(ctx context.Context, interval time.Duration) {
 }
 
 // ---------------------------------------------------------------------------
-// Loopback enforcement
-// ---------------------------------------------------------------------------
-
-// isLoopback returns true if the given address string refers to a
-// loopback interface (127.0.0.0/8 or ::1).
-func isLoopback(addr string) bool {
-	host, _, err := net.SplitHostPort(addr)
-	if err != nil {
-		host = addr
-	}
-	// Handle "" or "0.0.0.0" or "::" — these bind all interfaces.
-	if host == "" || host == "0.0.0.0" || host == "::" {
-		return false
-	}
-	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
-}
-
-// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
 func main() {
 	// --- CLI flags ---
-	addr := flag.String("listen", "127.0.0.1:0", "Listen address (port 0 = OS-assigned)")
+	addr := flag.String("listen", "tls-sidecar", "Abstract namespace socket name")
 	connectTimeout := flag.Duration("connect-timeout", 30*time.Second, "TCP+SOCKS+TLS timeout")
 	idleTimeout := flag.Duration("idle-timeout", 90*time.Second, "Pipe idle timeout")
 	bufSize := flag.Int("buffer", 65536, "Copy buffer size in bytes")
@@ -774,30 +755,20 @@ func main() {
 		log.Println("[WARN] *** TLS CERTIFICATE VERIFICATION DISABLED (--insecure) ***")
 	}
 
-	if !isLoopback(cfg.ListenAddr) {
-		log.Println("[WARN] *** Listening on non-loopback address! ***")
-		log.Printf("[WARN] *** %s is reachable from the network — this sidecar could be used as an open proxy. ***", cfg.ListenAddr)
-		log.Println("[WARN] *** Bind to 127.0.0.1 or ::1 unless you have a specific reason not to. ***")
-	}
-
-	// --- Start listener ---
-	ln, err := net.Listen("tcp", cfg.ListenAddr)
+	sockName := "\x00" + cfg.ListenAddr
+	ln, err := net.Listen("unix", sockName)
 	if err != nil {
-		// The Python SidecarManager looks for "ERROR" on stdout to
-		// detect startup failures.
 		fmt.Printf("ERROR %v\n", err)
 		os.Stdout.Sync()
 		os.Exit(1)
 	}
 
+	// Go's UnixAddr.String() returns @name for abstract sockets
 	boundAddr := ln.Addr().String()
-
-	// The Python SidecarManager reads this line to learn our address.
-	// Must be flushed immediately so the parent process doesn't block.
 	fmt.Printf("READY %s\n", boundAddr)
 	os.Stdout.Sync()
 
-	log.Printf("TLS sidecar on %s (Chrome fingerprint, utls)", boundAddr)
+	log.Printf("TLS sidecar on %s (abstract UDS, Chrome fingerprint, utls)", boundAddr)
 
 	// --- Graceful shutdown on SIGTERM/SIGINT ---
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)

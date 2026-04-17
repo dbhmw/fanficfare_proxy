@@ -52,6 +52,7 @@ import h2.config
 import h2.connection
 import h2.events
 import h2.exceptions
+import socket as _socket
 from asyncio import StreamReader, StreamWriter
 from dataclasses import dataclass, field
 from enum import Enum
@@ -2367,11 +2368,17 @@ class _ProxyHandler:
         sidecar_addr = sidecar.addr
         socks = self._proxy.socks_proxy
 
-        sc_host, sc_port_str = sidecar_addr.rsplit(":", 1)
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(sc_host, int(sc_port_str)),
-            timeout=5.0,
-        )
+        sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        try:
+            sock.connect(b"\x00" + sidecar_addr.lstrip("@").encode("ascii"))
+            sock.setblocking(False)
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(sock=sock),
+                timeout=5.0,
+            )
+        except Exception:
+            sock.close()
+            raise
 
         try:
             target = f"{host}:{port}"

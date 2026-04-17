@@ -9,6 +9,7 @@ from typing import Optional, Literal, Any, TypedDict, TextIO, cast
 import asyncio, zlib, argparse, configparser, sys, signal, logging
 import ssl, base64, hashlib, json, re, threading
 import weakref, gc, types, inspect
+import tempfile
 from xvfbwrapper import Xvfb
 from asyncio.sslproto import SSLProtocol
 from asyncio import StreamReader, StreamWriter, StreamReaderProtocol
@@ -313,11 +314,6 @@ class Init:
             if hasattr(args, 'impersonate') and args.impersonate
             else self.config.get("server", "impersonate", fallback='')
         )
-        self.impersonate_port: int = (
-            args.impersonate_port
-            if hasattr(args, 'impersonate_port') and args.impersonate_port
-            else self.config.getint("server", "impersonate_port", fallback=0)
-        )
 
     def prepserver(self) -> None:
         self.loop = asyncio.new_event_loop()
@@ -606,30 +602,22 @@ class ProxyServer:
             await self.send_response(writer, packet)
 
     async def receive_request(self, reader: StreamReader) -> bytes:
-        packet: bytes = b""
+        parts = bytearray()
         while True:
-            data: bytes = await reader.read(8192)
-            packet += data
-            if b"\0" in data:
-                logger.debug('End of data received')
-                break
+            data = await reader.read(8192)
             if not data:
                 logger.debug("No data received, closing connection.")
                 raise ConnectionResetError("No Data")
-
-        return packet
+            parts.extend(data)
+            if b"\0" in data:
+                logger.debug('End of data received')
+                break
+        return bytes(parts)
 
     async def send_response(self, writer: StreamWriter, response: bytes) -> None:
-        sent: int = 0
-        total: int = len(response)
-        while sent < total:
-            chunk: bytes = response[sent : sent + 8192]
-            writer.write(chunk)
-            await writer.drain()
-            sent += len(chunk)
-            complete: float = (sent / total) * 100
-            # print(f"Progress: {complete:.2f}%", end="\r")
-        logger.debug("Sent %s bytes successfully.", total)
+        writer.write(response)
+        await writer.drain()
+        logger.debug("Sent %s bytes successfully.", len(response))
 
     async def decrypt(self, packet: bytes) -> ServerRequest:
         logger.debug("Decode received data")
@@ -745,6 +733,48 @@ class ProxyServer:
                 tg.create_task(self.browsercontroller.shutdown_sessions())
                 logger.debug('browsercontroller shutdown')
 
+class ProxyLoop:
+    """Singleton background thread + event loop for all SessionProxy instances.
+    Instead of N threads for N sessions, all proxy servers share this
+    single loop.  asyncio handles thousands of concurrent connections on
+    one loop with no issues — the work is pure I/O forwarding.
+    """
+    _instance: Optional[ProxyLoop] = None
+    _lock = threading.Lock()
+
+    @classmethod
+    def get(cls) -> ProxyLoop:
+        """Return the shared instance, creating it on first call."""
+        if cls._instance is not None and cls._instance.is_alive():
+            return cls._instance
+        with cls._lock:
+            # Double-check after acquiring lock
+            if cls._instance is not None and cls._instance.is_alive():
+                return cls._instance
+            cls._instance = cls()
+            return cls._instance
+
+    def __init__(self) -> None:
+        self.loop: asyncio.AbstractEventLoop = asyncio.new_event_loop()
+        self._thread = threading.Thread(
+            target=self._run, daemon=True, name="SharedProxyLoop"
+        )
+        self._thread.start()
+
+    def _run(self) -> None:
+        asyncio.set_event_loop(self.loop)
+        self.loop.run_forever()
+
+    def is_alive(self) -> bool:
+        return self._thread.is_alive() and not self.loop.is_closed()
+
+    def stop(self) -> None:
+        """Shut down the shared loop. Call only during application exit."""
+        self.loop.call_soon_threadsafe(self.loop.stop)
+        self._thread.join(timeout=5)
+        if not self.loop.is_closed():
+            self.loop.close()
+
 class BrowserController:
     def __init__(self, config: Init) -> None:
         self.config = config
@@ -765,12 +795,12 @@ class BrowserController:
             if self.config.impersonate_chrome:
                 sidecar = SidecarManager(
                     binary_path=self.config.impersonate_chrome,
-                    listen_port=self.config.impersonate_port,
                     auto_restart=False,
                     verify_ssl=self.config.verify_ssl
                 )
                 await sidecar.start()
                 self.fp_proxy = sidecar
+                logger.info(sidecar)
         except Exception as e:
             logger.warning(e)
 
@@ -965,9 +995,15 @@ class BrowserController:
         tasks: list[asyncio.Task[None]] = [asyncio.create_task(self._shutdown_session(key))
              for key in list(self.sessions.keys())]
         await asyncio.gather(*tasks)
+
         if self.fp_proxy:
             await self.fp_proxy.stop()
         await self.destroy_main_driver()
+
+        try:
+            ProxyLoop.get().stop()
+        except Exception as e:
+            logger.warning("Failed to stop shared proxy loop: %s", e)
 
     async def _shutdown_session(self, session: str) -> None:
         logger.debug("Force %s", session)
@@ -1066,7 +1102,8 @@ class DrivenBrowser:
         self.current_id: int = random.randint(0, 100)
         self.last_used: float = time.time()
         self.in_use: int = 0
-        self.downloads_dir: str = f"/tmp/downloads_{str(random.randint(0, 100000))}"
+        self.downloads_dir: str = tempfile.mkdtemp(prefix=f"downloads_{session}_")
+        logger.debug("Created dir %s", self.downloads_dir)
 
         self.config = config
         self.virt_disp: bool = config.virt_disp
@@ -1090,9 +1127,6 @@ class DrivenBrowser:
             raise RuntimeError("No context")
 
         # Image testing selenium proxy https://archiveofourown.org/works/61648471?view_full_work=true&view_adult=true
-        if not os.path.isdir(self.downloads_dir):
-            os.mkdir(self.downloads_dir)
-            logger.debug("Created dir %s", self.downloads_dir)
         await self.context.set_download_behaviour('allowAndName', self.downloads_dir)
 
         if self.virt_disp:
@@ -1195,111 +1229,60 @@ class DrivenBrowser:
     async def initialize_socks5(self) -> None:
         self.socks_proxy_instance = SessionProxy(
             host=self.config.host,
-            port=self.proxy_instance_port,
+            port=0,  # OS-assigned, as before
             socks_pool=SocksProxyPool(self.config.socks5_file),
             ca_cert=self.config.mitm_ca_cert,
             ca_key=self.config.mitm_ca_key,
             config=ProxyConfig(connect_timeout=61.0, verify_ssl=self.config.verify_ssl),
-            sidecar = self.fp_proxy() if self.fp_proxy else None,
+            sidecar=self.fp_proxy() if self.fp_proxy else None,
         )
 
-        self._proxy_started = threading.Event()
-        # Shared dict so the static method can pass data back
-        _proxy_state: dict[str, Any] = {}
+        # Get the shared loop instead of creating a new thread
+        proxy_loop = ProxyLoop.get()
+        self.socks_proxy_loop = proxy_loop.loop
 
-        self.socks_proxy_thread = threading.Thread(
-            target=DrivenBrowser._run_socks5_proxy_static,
-            args=(self.socks_proxy_instance, self._proxy_started, _proxy_state),
-            daemon=True,
-            name="SocksProxyThread",
+        # Start the proxy on the shared loop (cross-thread call)
+        future = asyncio.run_coroutine_threadsafe(
+            self.socks_proxy_instance.start(),
+            self.socks_proxy_loop,
         )
-        self.socks_proxy_thread.start()
 
-        if not self._proxy_started.wait(timeout=10):
-            raise RuntimeError("SOCKS5 proxy failed to start within 10 seconds")
+        # Wait for port assignment (blocks the calling coroutine, not the loop)
+        self.proxy_instance_port = await asyncio.wrap_future(future)
 
-        self.proxy_instance_port = _proxy_state['port']
-        self.socks_proxy_loop = _proxy_state['loop']
-        del _proxy_state
         logger.info(
-            "SOCKS5 proxy started on port %d (thread: %s)",
+            "SOCKS5 proxy started on port %d (shared loop)",
             self.proxy_instance_port,
-            self.socks_proxy_thread.name,
         )
-
-    @staticmethod
-    def _run_socks5_proxy_static(proxy_instance: 'SessionProxy', started_event: threading.Event, state: dict[str, Any]) -> None:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        state['loop'] = loop
-
-        try:
-            port = loop.run_until_complete(proxy_instance.start())
-            state['port'] = port
-            started_event.set()
-            loop.run_forever()
-        except asyncio.CancelledError:
-            logger.info("SOCKS5 proxy loop cancelled")
-        except Exception:
-            logger.error("SOCKS5 proxy thread error: %s", traceback.format_exc())
-            started_event.set()
-        finally:
-            pending = asyncio.all_tasks(loop)
-            for task in pending:
-                task.cancel()
-            if pending:
-                try:
-                    results = loop.run_until_complete(
-                        asyncio.wait_for(
-                            asyncio.gather(*pending, return_exceptions=True),
-                            timeout=4.0
-                        )
-                    )
-                    for task, result in zip(pending, results):
-                        if isinstance(result, Exception) and not isinstance(result, asyncio.CancelledError):
-                            logger.debug("Task %s raised during cancel: %s", task.get_name(), result)
-                except asyncio.TimeoutError:
-                    still_pending = [t for t in pending if not t.done()]
-                    for t in still_pending:
-                        logger.warning("Task did not finish cancellation: %s coro=%s",
-                                    t.get_name(), t.get_coro())
-            loop.close()
 
     async def socks5_shutdown(self) -> None:
-        """Stop the proxy server and its thread."""
+        """Stop the proxy server"""
         if not hasattr(self, "socks_proxy_instance") or not self.socks_proxy_instance:
             return
-        if not hasattr(self, "socks_proxy_loop") or self.socks_proxy_loop.is_closed():
+        loop = self.socks_proxy_loop
+        if loop is None or loop.is_closed():
             return
 
         logger.info("Stopping SOCKS5 proxy...")
-        loop = self.socks_proxy_loop
+
+        # Close active connections
         future = asyncio.run_coroutine_threadsafe(
             self.socks_proxy_instance.close_all_handlers(), loop
         )
-
-        logger.trace("Awaiting close_all_handlers")
         try:
+            logger.trace("Awaiting close_all_handlers")
             await asyncio.wait_for(asyncio.wrap_future(future), timeout=10.0)
         except (Exception, asyncio.TimeoutError) as e:
             logger.warning("close_all_handlers error: %s", e)
 
+        # Stop the server
         future = asyncio.run_coroutine_threadsafe(
             self.socks_proxy_instance.stop(), loop
         )
-        logger.trace("Awaiting stop")
         try:
             await asyncio.wrap_future(future)
         except Exception as e:
             logger.warning("stop error: %s", e)
-
-        loop.call_soon_threadsafe(loop.stop)
-        if self.socks_proxy_thread and self.socks_proxy_thread.is_alive():
-            await asyncio.get_running_loop().run_in_executor(
-                None, self.socks_proxy_thread.join, 5
-            )
-            if self.socks_proxy_thread.is_alive():
-                logger.warning("SOCKS5 proxy thread did not exit cleanly")
 
         logger.info("SOCKS5 proxy stopped")
 
@@ -1851,6 +1834,9 @@ class ClientRequest:
                 tab, drivenbrowser_id = await self.drivenbrowser().get_tab(self.requestid)
                 continue
 
+            if result[0] == 525:
+                continue
+
             if result[0] != 404 and 400 < result[0] < 500:
                 page_title = await tab.title
                 if 'used Cloudflare to restrict hotlinking' in page_title:
@@ -1858,8 +1844,8 @@ class ClientRequest:
                     request['headers']['Referer'] = request['url']
                     continue
 
-                if await self.is_captcha(tab, result[0], request['session']):
-                    continue
+                await self.is_captcha(tab, result[0], request['session'])
+                continue
             break
         else:
             logger.warning("Failed to get the content. Sending as is!")
@@ -1911,11 +1897,10 @@ parser.add_argument('--chrome', dest='chrome', type=str, metavar='PATH', help='P
 parser.add_argument('--ublock', dest='ublock', type=str, metavar='PATH', help='Path to extension file')
 parser.add_argument('--driver-timeout', dest='driver_timeout', type=int, metavar='SECONDS', default=None, help='Time in seconds to close Chrome after last request (default: 60)')
 
-parser.add_argument('--mitm-cert', dest='mitm_ca_key', type=str, metavar='PATH', help=argparse.SUPPRESS)
-parser.add_argument('--mitm-key', dest='mitm_ca_cert', type=str, metavar='PATH', help=argparse.SUPPRESS)
+parser.add_argument('--mitm-key', dest='mitm_ca_key', type=str, metavar='PATH', help=argparse.SUPPRESS)
+parser.add_argument('--mitm-cert', dest='mitm_ca_cert', type=str, metavar='PATH', help=argparse.SUPPRESS)
 
-parser.add_argument('--impersonate', dest='impersonate', type=str, default='', help=argparse.SUPPRESS)
-parser.add_argument('--impersonate-port', dest='impersonate_port', type=int, metavar='PORT', help=argparse.SUPPRESS)
+parser.add_argument('--impersonate', dest='impersonate_chrome', type=str, default='', help=argparse.SUPPRESS)
 
 args: argparse.Namespace = parser.parse_args()
 
