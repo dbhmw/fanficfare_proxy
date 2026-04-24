@@ -56,6 +56,16 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+def set_sidecar_log_level(level: int) -> None:
+    """Set the log level for this module's logger.
+
+    Parameters
+    ----------
+    level:
+        Standard ``logging`` level (``logging.DEBUG``, ``logging.INFO``, …).
+    """
+    logger.setLevel(level)
+
 
 # ── Known stat fields — guards against new Go-side fields breaking us ──
 _STATS_FIELDS = frozenset({
@@ -433,7 +443,7 @@ class SidecarManager:
 
         # Start stderr forwarder (Go's log.Printf writes to stderr)
         stderr_task = asyncio.create_task(
-            self._forward_stderr(), name="sidecar-stderr"
+            self._forward_stream(self._process.stderr, "[sidecar]"), name="sidecar-stderr"
         )
         self._io_tasks.append(stderr_task)
 
@@ -447,11 +457,13 @@ class SidecarManager:
             logger.error(
                 "Sidecar failed to start within %.1fs", self.startup_timeout
             )
+            await self._cancel_io_tasks()
             await self._kill_process()
             raise RuntimeError(
                 f"Sidecar failed to start within {self.startup_timeout}s"
             )
         except Exception:
+            await self._cancel_io_tasks()
             await self._kill_process()
             raise
 
@@ -462,16 +474,15 @@ class SidecarManager:
         level (the sidecar shouldn't print anything else before READY,
         but we handle it gracefully).
         """
-        assert self._process and self._process.stdout
+        if not (self._process and self._process.stdout):
+            raise RuntimeError("Missing tasks.")
 
         while True:
             line = await self._process.stdout.readline()
             if not line:
                 # Process exited before printing READY
                 rc = await self._process.wait()
-                raise RuntimeError(
-                    f"Sidecar exited during startup (rc={rc})"
-                )
+                raise RuntimeError(f"Sidecar exited during startup (rc={rc})")
 
             decoded = line.decode("utf-8", errors="replace").strip()
 
@@ -480,7 +491,7 @@ class SidecarManager:
                 logger.debug("Sidecar signaled READY on %s", addr)
                 # Continue forwarding remaining stdout in background
                 stdout_task = asyncio.create_task(
-                    self._forward_stdout(), name="sidecar-stdout"
+                    self._forward_stream(self._process.stdout, "[sidecar:stdout]"), name="sidecar-stdout"
                 )
                 self._io_tasks.append(stdout_task)
                 return addr
@@ -509,29 +520,15 @@ class SidecarManager:
 
         return reader, writer
 
-    async def _forward_stdout(self) -> None:
-        """Forward remaining sidecar stdout to the Python logger."""
+    async def _forward_stream(self, stream: Optional[asyncio.StreamReader], prefix: str) -> None:
+        """Forward a subprocess stream line-by-line to the Python logger."""
+        if stream is None:
+            return
         try:
-            if not self._process or not self._process.stdout:
-                return
-            async for line in self._process.stdout:
+            async for line in stream:
                 decoded = line.decode("utf-8", errors="replace").rstrip()
                 if decoded:
-                    logger.debug("[sidecar:stdout] %s", decoded)
-        except asyncio.CancelledError:
-            pass
-        except Exception:
-            pass
-
-    async def _forward_stderr(self) -> None:
-        """Forward sidecar stderr (Go ``log.Printf`` output) to the Python logger."""
-        try:
-            if not self._process or not self._process.stderr:
-                return
-            async for line in self._process.stderr:
-                decoded = line.decode("utf-8", errors="replace").rstrip()
-                if decoded:
-                    logger.debug("[sidecar] %s", decoded)
+                    logger.debug("%s %s", prefix, decoded)
         except asyncio.CancelledError:
             pass
         except Exception:
@@ -549,7 +546,6 @@ class SidecarManager:
 
     async def _kill_process(self) -> None:
         """Force-kill the sidecar process if it's still running."""
-        await self._cancel_io_tasks()
         if self._process and self._process.returncode is None:
             try:
                 self._process.kill()
@@ -568,75 +564,60 @@ class SidecarManager:
         4. Spawns a new process on the same port.
 
         If the restart also fails (e.g. port conflict), the error is
-        logged and the loop retries on the next poll.
-
-        The restart counter is reset whenever ``ping()`` succeeds, so
-        a sidecar that crashes once but then runs stably doesn't
-        accumulate towards the budget.
-
-        FIX: On ``EADDRINUSE`` during restart (the OS reassigned the
-        port in the brief window between crash and restart), fall back
-        to port 0 (OS-assigned) and update ``_bound_port`` so
-        subsequent restarts use the new port.
+        logged and the loop retries.
         """
         try:
             while not self._stopping:
-                await asyncio.sleep(5.0)
+                if self._process is None:
+                    return  # nothing to supervise
+                rc = await self._process.wait()
 
                 if self._stopping:
-                    break
+                    return
 
-                if self._process and self._process.returncode is not None:
-                    rc = self._process.returncode
-                    logger.warning(
-                        "Sidecar exited unexpectedly (rc=%d)", rc
-                    )
-                    self._addr = None
+                logger.warning("Sidecar exited unexpectedly (rc=%d)", rc)
+                self._addr = None
 
-                    if self._restart_count >= self.max_restarts:
-                        logger.error(
-                            "Sidecar crashed %d times, giving up",
-                            self._restart_count,
-                        )
-                        break
-
-                    self._restart_count += 1
-                    logger.info(
-                        "Restarting sidecar (attempt %d/%d) in %.1fs...",
+                if self._restart_count >= self.max_restarts:
+                    logger.error(
+                        "Sidecar crashed %d times, giving up",
                         self._restart_count,
-                        self.max_restarts,
-                        self.restart_delay,
                     )
-                    await asyncio.sleep(self.restart_delay)
+                    return
 
-                    if self._stopping:
-                        break
+                self._restart_count += 1
+                logger.info(
+                    "Restarting sidecar (attempt %d/%d) in %.1fs...",
+                    self._restart_count, self.max_restarts, self.restart_delay,
+                )
+                await asyncio.sleep(self.restart_delay)
 
-                    try:
-                        self._addr = await self._spawn()
-                        self._started_at = time.monotonic()
-                        logger.info(
-                            "Sidecar restarted on %s (pid=%d)",
-                            self._addr,
-                            self.pid,
+                if self._stopping:
+                    return
+
+                try:
+                    self._addr = await self._spawn()
+                    self._started_at = time.monotonic()
+                    logger.info(
+                        "Sidecar restarted on %s (pid=%d)", self._addr, self.pid,
+                    )
+                except RuntimeError as e:
+                    err_msg = str(e).lower()
+                    if "address already in use" in err_msg:
+                        # Abstract UDS name collision — retry on a fresh name.
+                        # Next loop iteration will pick it up.
+                        new_name = f"{self.socket_name}-{int(time.monotonic())}"
+                        logger.warning(
+                            "Socket %s in use, will retry as %s",
+                            self._bound_name, new_name,
                         )
-                    except RuntimeError as e:
-                        err_msg = str(e)
-                        # If the port is taken, fall back to OS-assigned
-                        if "address already in use" in err_msg.lower():
-                            new_name = f"{self.socket_name}-{int(time.monotonic())}"
-                            logger.warning(
-                                "Socket %s in use, retrying as %s",
-                                self._bound_name, new_name,
-                            )
-                            self._bound_name = new_name
-                        else:
-                            logger.error("Sidecar restart failed: %s", e)
-                    except asyncio.CancelledError:
-                        # stop() was called during restart — clean up
-                        await self._kill_process()
-                        raise
-
+                        self._bound_name = new_name
+                        # Loop continues — next iteration re-spawns.
+                        # No process to wait() on, so short-circuit:
+                        continue
+                    else:
+                        logger.error("Sidecar restart failed: %s", e)
+                        return
         except asyncio.CancelledError:
             pass
 

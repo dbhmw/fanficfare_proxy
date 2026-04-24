@@ -48,10 +48,13 @@ import threading
 import time
 import traceback
 import zlib
+import weakref
 import h2.config
 import h2.connection
 import h2.events
 import h2.exceptions
+import h2.settings
+from hyperframe.frame import SettingsFrame as _HF_SettingsFrame
 import socket as _socket
 from asyncio import StreamReader, StreamWriter
 from dataclasses import dataclass, field
@@ -72,6 +75,30 @@ except ImportError:
             "Install it with: pip install brotli"
         )
 
+
+# ── Patch h2 to allow streams below last_stream_id to continue after GOAWAY.
+# RFC 9113 §6.8 explicitly permits this; h2's state machine does not
+# (https://github.com/python-hyper/h2/issues/1181, open since 2019). 
+# Without this patch, servers that send GOAWAY before their final response 
+# frames trigger ProtocolError mid-response.
+from h2.connection import (
+    H2ConnectionStateMachine,
+    ConnectionState,
+    ConnectionInputs,
+)
+
+def _relax_h2_goaway_state() -> None:
+    transitions = H2ConnectionStateMachine._transitions
+    for open_state in (ConnectionState.CLIENT_OPEN, ConnectionState.SERVER_OPEN):
+        for input_ in (ConnectionInputs.RECV_GOAWAY, ConnectionInputs.SEND_GOAWAY):
+            key = (open_state, input_)
+            if key in transitions:
+                func, _old_target = transitions[key]
+                transitions[key] = (func, open_state)  # stay open instead of CLOSED
+
+_relax_h2_goaway_state()
+
+_draining_h2_conns: "weakref.WeakSet[h2.connection.H2Connection]" = weakref.WeakSet()
 
 # ============================================================================
 # Configuration
@@ -195,13 +222,19 @@ def _decompress_body(data: bytes, encoding: str) -> bytes:
         elif encoding == "zstd":
             try:
                 import zstandard
-
-                return zstandard.ZstdDecompressor().decompress(data)
             except ImportError:
                 raise RuntimeError(
-                    "Zstandard-compressed response received but 'zstandard' package "
-                    "is not installed. Install it with: pip install zstandard"
+                    "Zstandard-compressed response received but 'zstandard' "
+                    "package is not installed. Install it with: pip install zstandard"
                 )
+            reader = zstandard.ZstdDecompressor().stream_reader(data)
+            chunks = []
+            while True:
+                chunk = reader.read(65536)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            return b"".join(chunks)
         elif encoding == "identity":
             return data
         else:
@@ -1642,14 +1675,52 @@ class Http2Handler:
             client_side=True, validate_inbound_headers=False
         )
         target_conn = h2.connection.H2Connection(config=target_config)
+        # ── Chrome H2 fingerprint ─────────────────────────────────
+        # Set Chrome's SETTINGS values so h2's internal state (flow
+        # control windows, HPACK table size) is correct.
+        target_conn.local_settings = h2.settings.Settings(
+            client=True,
+            initial_values={
+                h2.settings.SettingCodes.HEADER_TABLE_SIZE: 65536,
+                h2.settings.SettingCodes.ENABLE_PUSH: 0,
+                h2.settings.SettingCodes.INITIAL_WINDOW_SIZE: 6291456,
+                h2.settings.SettingCodes.MAX_HEADER_LIST_SIZE: 262144,
+            },
+        )
+        # Sync the HPACK decoder to our advertised table size —
+        # h2 doesn't do this when local_settings is replaced post-construction.
+        target_conn.decoder.max_allowed_table_size = 65536
+        target_conn.decoder.max_header_list_size = 262144
         target_conn.initiate_connection()
+
+        # Discard h2's auto-generated preface — it includes
+        # MAX_FRAME_SIZE and ENABLE_CONNECT_PROTOCOL which Chrome
+        # does not send, altering the Akamai H2 fingerprint hash.
+        target_conn.data_to_send()
+
+        # Build Chrome's exact connection preface manually:
+        #   magic + SETTINGS(1:65536, 2:0, 4:6291456, 6:262144)
+        _sf = _HF_SettingsFrame(stream_id=0)
+        _sf.settings = {
+            0x1: 65536,    # HEADER_TABLE_SIZE
+            0x2: 0,        # ENABLE_PUSH
+            0x4: 6291456,  # INITIAL_WINDOW_SIZE  (6 MB)
+            0x6: 262144,   # MAX_HEADER_LIST_SIZE (256 KB)
+        }
+        chrome_preface = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" + _sf.serialize()
+
+        # Chrome sends WINDOW_UPDATE on stream 0 right after
+        # SETTINGS, bumping the connection-level window to ~15 MB.
+        # Using h2's API keeps internal flow-control state consistent.
+        target_conn.increment_flow_control_window(15663105)
+        chrome_preface += target_conn.data_to_send()
 
         streams = _StreamMap()
         captures: dict[int, _ResponseCapture] = {}
 
         self._proxy._track_h2_state(client_conn, target_conn, client, target)
         try:
-            target.writer.write(target_conn.data_to_send())
+            target.writer.write(chrome_preface)
             await target.writer.drain()
 
             # Read target's SETTINGS frame (connection preface)
@@ -1838,6 +1909,17 @@ class Http2Handler:
         if isinstance(event, h2.events.RequestReceived):
             cid = event.stream_id
 
+            # Refuse new streams if the target already GOAWAY'd on this tunnel.
+            # REFUSED_STREAM is the spec-defined signal to retry on a fresh conn;
+            # the browser should have just received our forwarded GOAWAY and will
+            # open a new CONNECT for the retry.
+            if target_conn in _draining_h2_conns:
+                try:
+                    client_conn.reset_stream(cid, error_code=7)  # REFUSED_STREAM
+                except Exception:
+                    pass
+                return
+
             if len(streams) >= self.config.max_streams_per_connection:
                 client_conn.reset_stream(cid, error_code=7)
                 return
@@ -1919,35 +2001,47 @@ class Http2Handler:
             error_code = getattr(event, "error_code", 0)
             additional = getattr(event, "additional_data", b"")
             logger.debug(
-                "[GOAWAY] Client sent GOAWAY (last_stream=%s, error=%s, data=%s) — "
-                "tearing down handler (%d active streams)",
-                last_id,
-                error_code,
-                additional,
-                len(streams),
+                "[GOAWAY] Client GOAWAY (last_stream=%s, error=%s) — "
+                "forwarding to target; draining %d stream(s).",
+                last_id, error_code, len(streams),
             )
 
-            # Deliver any in-flight captures before cleanup
-            for cid, cap in list(captures.items()):
-                if cap.status_code:
-                    self._proxy._deliver_capture(cap)
-            captures.clear()
+            _draining_h2_conns.add(client_conn)
 
-            # Reset all active streams on the target side
-            for stream in streams.values():
-                try:
-                    target_conn.reset_stream(stream.target_id, error_code=2)
-                except Exception:
-                    pass
-            streams.clear()
+            if last_id is not None:
+                doomed = [s for s in streams.values() if s.client_id > last_id]
+                for stream in doomed:
+                    try:
+                        target_conn.reset_stream(stream.target_id, error_code=7)
+                    except Exception:
+                        pass
+                    cap = captures.pop(stream.client_id, None)
+                    if cap and cap.status_code:
+                        self._proxy._deliver_capture(cap)
+                    streams.remove_by_client(stream.client_id)
 
-            # Forward GOAWAY to the target
+            if last_id is not None:
+                target_last_id = max(
+                    (s.target_id for s in streams.values() if s.client_id <= last_id),
+                    default=0,
+                )
+            else:
+                target_last_id = max(
+                    (s.target_id for s in streams.values()),
+                    default=0,
+                )
+
             try:
-                target_conn.close_connection(error_code=0)
-            except Exception:
-                pass
+                target_conn.close_connection(
+                    error_code=error_code or 0,
+                    last_stream_id=target_last_id,
+                    additional_data=additional,
+                )
+            except Exception as e:
+                logger.debug("Failed to forward GOAWAY to target: %s", e)
 
-            raise _ClientGoaway(last_id, error_code, additional)
+            # Do NOT raise _TargetGoaway. Let remaining streams finish; the
+            # _handle_target loop will exit on EOF when the server closes TCP.
 
     async def _process_target_event(
         self,
@@ -2048,35 +2142,55 @@ class Http2Handler:
             error_code = getattr(event, "error_code", 0)
             additional = getattr(event, "additional_data", b"")
             logger.debug(
-                "[GOAWAY] Target sent GOAWAY (last_stream=%s, error=%s, data=%s) — "
-                "tearing down handler (%d active streams)",
-                last_id,
-                error_code,
-                additional,
-                len(streams),
+                "[GOAWAY] Target GOAWAY (last_stream=%s, error=%s) — "
+                "forwarding to browser; draining %d stream(s).",
+                last_id, error_code, len(streams),
             )
 
-            # Deliver any in-flight captures before cleanup
-            for cid, cap in list(captures.items()):
-                if cap.status_code:
-                    self._proxy._deliver_capture(cap)
-            captures.clear()
+            # Mark this target as draining. Any new RequestReceived that races
+            # the GOAWAY will be refused so the browser retries on a fresh conn.
+            _draining_h2_conns.add(target_conn)
 
-            # Reset all active streams on the client side
-            for stream in streams.values():
-                try:
-                    client_conn.reset_stream(stream.client_id, error_code=2)
-                except Exception:
-                    pass
-            streams.clear()
+            # (1) RST local target streams above last_id — server won't process them.
+            # REFUSED_STREAM (7) tells the browser the request is safe to retry.
+            if last_id is not None:
+                doomed = [s for s in streams.values() if s.target_id > last_id]
+                for stream in doomed:
+                    try:
+                        client_conn.reset_stream(stream.client_id, error_code=7)
+                    except Exception:
+                        pass
+                    cap = captures.pop(stream.client_id, None)
+                    if cap and cap.status_code:
+                        self._proxy._deliver_capture(cap)
+                    streams.remove_by_client(stream.client_id)
 
-            # Forward GOAWAY to the browser
+            # (2) Forward GOAWAY to the browser with last_id translated into
+            # *client* stream-ID space (max client_id whose target_id ≤ last_id).
+            if last_id is not None:
+                client_last_id = max(
+                    (s.client_id for s in streams.values() if s.target_id <= last_id),
+                    default=0,
+                )
+            else:
+                # Unknown last_id — echo the highest client stream we know about
+                # so every in-flight request is permitted to complete.
+                client_last_id = max(
+                    (s.client_id for s in streams.values()),
+                    default=0,
+                )
+
             try:
-                client_conn.close_connection(error_code=0)
-            except Exception:
-                pass
+                client_conn.close_connection(
+                    error_code=error_code or 0,
+                    last_stream_id=client_last_id,
+                    additional_data=additional,
+                )
+            except Exception as e:
+                logger.debug("Failed to forward GOAWAY to client: %s", e)
 
-            raise _TargetGoaway(last_id, error_code, additional)
+            # Do NOT raise _TargetGoaway. Let remaining streams finish; the
+            # _handle_target loop will exit on EOF when the server closes TCP.
 
 
 # ============================================================================
@@ -2110,58 +2224,18 @@ class _ProxyHandler:
         self._proxy._track_connection(client)
 
         try:
-            async with asyncio.timeout(self.config.request_timeout):
-                line = await reader.readline()
-                if not line:
-                    return
+            req = await self.http1._read_request(client)
+            if req is None:
+                return
 
-                request_line = line.decode("utf-8", errors="replace").strip()
-                parts = request_line.split(" ", 2)
-                if len(parts) < 3:
-                    return
-
-                method, target_url, version = parts
-
-                headers: dict[str, str] = {}
-                raw_headers: list[tuple[str, str]] = []
-                content_length = 0
-                chunked = False
-
-                while True:
-                    hl = await reader.readline()
-                    if not hl or hl == b"\r\n":
-                        break
-                    decoded = hl.decode("utf-8", errors="replace").strip()
-                    if ":" in decoded:
-                        k, v = decoded.split(":", 1)
-                        ks, vs = k.strip(), v.strip()
-                        headers[ks.lower()] = vs
-                        raw_headers.append((ks, vs))
-                        kl = ks.lower()
-                        if kl == "content-length":
-                            content_length = int(vs)
-                        elif (
-                            kl == "transfer-encoding"
-                            and "chunked" in vs.lower()
-                        ):
-                            chunked = True
+            method, path, version, raw_headers, body = req
 
             if method == "CONNECT":
-                await self._handle_connect(client, target_url)
+                await self._handle_connect(client, path)
             else:
-                body = b""
-                if chunked:
-                    body = await self._read_chunked_body(reader)
-                elif content_length > 0:
-                    body = await reader.readexactly(content_length)
+                headers_dict = {k.lower(): v for k, v in raw_headers}
                 await self._handle_plain_http(
-                    client,
-                    method,
-                    target_url,
-                    version,
-                    raw_headers,
-                    body,
-                    headers,
+                    client, method, path, version, raw_headers, body, headers_dict,
                 )
 
         except asyncio.TimeoutError:
@@ -2538,19 +2612,6 @@ class _ProxyHandler:
 
     # -- helpers -----------------------------------------------------------
 
-    async def _read_chunked_body(self, reader: StreamReader) -> bytes:
-        """Read a chunked-encoded request body."""
-        body = bytearray()
-        while True:
-            size_line = await reader.readline()
-            size = int(size_line.strip(), 16)
-            if size == 0:
-                await reader.readline()
-                break
-            body.extend(await reader.readexactly(size))
-            await reader.readline()
-        return bytes(body)
-
     @staticmethod
     def _try_error(client: ManagedConnection, msg: bytes) -> None:
         """Best-effort error response — swallows exceptions."""
@@ -2603,22 +2664,20 @@ class SessionProxy:
         ca_cert: str,
         ca_key: str,
         socks_pool: Optional[SocksProxyPool] = None,
-        socks_proxy: Optional[str] = None,
         host: str = "127.0.0.1",
         port: int = 0,
         config: ProxyConfig = DEFAULT_CONFIG,
         sidecar: Optional[SidecarManager] = None,
-    ):
+        ):
+
         self.host = host
         self.port = port
         self.config = config
         self.rule: Optional[Rule] = None
 
         self._socks_pool = socks_pool
-        # Explicit proxy takes precedence; otherwise auto-assign from pool
-        if socks_proxy:
-            self.socks_proxy: Optional[str] = socks_proxy
-        elif socks_pool:
+
+        if socks_pool:
             self.socks_proxy = socks_pool.assign()
         else:
             self.socks_proxy = None
@@ -2886,7 +2945,6 @@ class SessionProxy:
 
 def set_proxy_log_level(level: int) -> None:
     """Set the log level for the proxy module. Call once from your main script."""
-    _handler.setLevel(level)
     logger.setLevel(level)
 
 class CustomLogger(logging.Logger):
@@ -2915,14 +2973,3 @@ class ColoredFormatter(logging.Formatter):
 
 
 logger: CustomLogger = logging.getLogger(__name__)  # type: ignore[assignment]
-_handler = logging.StreamHandler()
-_handler.setFormatter(
-    ColoredFormatter(
-        "%(elapsed)s | %(levelname)-8s | %(filename)s | %(funcName)s[%(lineno)d] | %(message)s"
-    )
-)
-logger.addHandler(_handler)
-
-_asyncio_logger = logging.getLogger("asyncio")
-_asyncio_logger.addHandler(_handler)
-_asyncio_logger.propagate = False

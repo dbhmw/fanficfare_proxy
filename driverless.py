@@ -2,7 +2,7 @@ from __future__ import annotations
 import uvloop
 uvloop.install()
 import patch_func
-from utls_bridge.sidecar import SidecarManager
+from utls_bridge.sidecar import SidecarManager, set_sidecar_log_level
 from proxy_server import SessionProxy, SocksProxyPool, ProxyConfig, set_proxy_log_level
 
 from typing import Optional, Literal, Any, TypedDict, TextIO, cast
@@ -225,6 +225,7 @@ class Init:
         logger.setLevel(self.log_lvl)
         ch.setLevel(self.log_lvl)
         set_proxy_log_level(self.log_lvl)
+        set_sidecar_log_level(self.log_lvl)
 
     def config_ini(self) -> None: # ConfigDict:
         self.port: int = (
@@ -734,23 +735,30 @@ class ProxyServer:
                 logger.debug('browsercontroller shutdown')
 
 class ProxyLoop:
-    """Singleton background thread + event loop for all SessionProxy instances.
-    Instead of N threads for N sessions, all proxy servers share this
-    single loop.  asyncio handles thousands of concurrent connections on
-    one loop with no issues — the work is pure I/O forwarding.
-    """
+    """Singleton background thread + event loop for all SessionProxy instances."""
     _instance: Optional[ProxyLoop] = None
     _lock = threading.Lock()
 
     @classmethod
     def get(cls) -> ProxyLoop:
-        """Return the shared instance, creating it on first call."""
         if cls._instance is not None and cls._instance.is_alive():
+            logger.debug("ProxyLoop already created")
             return cls._instance
+
         with cls._lock:
-            # Double-check after acquiring lock
+            # Second check — another thread may have created it while
+            # we were waiting for the lock
             if cls._instance is not None and cls._instance.is_alive():
+                logger.debug("ProxyLoop already created by another thread")
                 return cls._instance
+
+            if cls._instance is not None:
+                logger.warning("ProxyLoop was dead, recreating (thread=%s, loop_closed=%s)",
+                            cls._instance._thread.is_alive(),
+                            cls._instance.loop.is_closed())
+            else:
+                logger.debug("ProxyLoop first-time creation")
+
             cls._instance = cls()
             return cls._instance
 
@@ -760,20 +768,34 @@ class ProxyLoop:
             target=self._run, daemon=True, name="SharedProxyLoop"
         )
         self._thread.start()
+        logger.info("ProxyLoop thread started (tid=%d, thread=%s)",
+                     self._thread.ident, self._thread.name)
 
     def _run(self) -> None:
         asyncio.set_event_loop(self.loop)
+        logger.debug("ProxyLoop event loop running")
         self.loop.run_forever()
+        logger.debug("ProxyLoop event loop stopped")
 
     def is_alive(self) -> bool:
-        return self._thread.is_alive() and not self.loop.is_closed()
+        alive = self._thread.is_alive() and not self.loop.is_closed()
+        if not alive:
+            logger.warning("ProxyLoop not alive (thread=%s, loop_closed=%s)",
+                           self._thread.is_alive(), self.loop.is_closed())
+        return alive
 
     def stop(self) -> None:
-        """Shut down the shared loop. Call only during application exit."""
+        logger.info("ProxyLoop stopping...")
         self.loop.call_soon_threadsafe(self.loop.stop)
         self._thread.join(timeout=5)
+        if self._thread.is_alive():
+            logger.warning("ProxyLoop thread did not exit within 5s")
+        else:
+            logger.debug("ProxyLoop thread joined")
         if not self.loop.is_closed():
             self.loop.close()
+            logger.debug("ProxyLoop event loop closed")
+        logger.info("ProxyLoop stopped")
 
 class BrowserController:
     def __init__(self, config: Init) -> None:
@@ -1877,7 +1899,9 @@ ch: logging.StreamHandler[TextIO] = logging.StreamHandler()
 formatter: ColoredFormatter = ColoredFormatter('%(elapsed)s | %(levelname)-8s | %(filename)s | %(funcName)s[%(lineno)d] | %(message)s')
 ch.setFormatter(formatter)
 # Add the handler to the logger
-logger.addHandler(ch)
+root = logging.getLogger()
+root.addHandler(ch)
+root.setLevel(logging.WARNING)
 
 parser = argparse.ArgumentParser(description="SeleniumServer")
 parser.add_argument('-c','--config', type=str, metavar='PATH', default='./config.ini', help="Path to config")
