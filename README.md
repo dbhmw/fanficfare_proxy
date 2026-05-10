@@ -69,7 +69,7 @@ use_driverless_proxy: true
 ```
 Again, replace the paths above with the actual locations on your system.
 
-### Running after install initial install
+### Running after initial install
 
 #### Option A
 Activate the virtual env and run the python script

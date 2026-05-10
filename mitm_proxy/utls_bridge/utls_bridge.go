@@ -698,22 +698,22 @@ func pipe(client, target net.Conn, cfg Config) {
 
 // statsLoop periodically logs operational metrics to stderr.
 // Respects the provided context for clean shutdown.
-func statsLoop(ctx context.Context, interval time.Duration) {
-	t := time.NewTicker(interval)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-			s := metrics.Snapshot()
-			// FIX #11: Consistent formatting (tabs vs spaces fixed).
-			log.Printf("[STATS] active=%d total=%d tls=%d tls_err=%d socks=%d bytes=%d gr=%d",
-				s.ActiveConns, s.TotalConns, s.TLSHandshakes, s.TLSErrors,
-				s.SOCKSConns, s.TotalBytes, s.Goroutines)
-		}
-	}
-}
+// func statsLoop(ctx context.Context, interval time.Duration) {
+// 	t := time.NewTicker(interval)
+// 	defer t.Stop()
+// 	for {
+// 		select {
+// 		case <-ctx.Done():
+// 			return
+// 		case <-t.C:
+// 			s := metrics.Snapshot()
+// 			// FIX #11: Consistent formatting (tabs vs spaces fixed).
+// 			log.Printf("[STATS] active=%d total=%d tls=%d tls_err=%d socks=%d bytes=%d gr=%d",
+// 				s.ActiveConns, s.TotalConns, s.TLSHandshakes, s.TLSErrors,
+// 				s.SOCKSConns, s.TotalBytes, s.Goroutines)
+// 		}
+// 	}
+// }
 
 // ---------------------------------------------------------------------------
 // Main
@@ -726,7 +726,7 @@ func main() {
 	idleTimeout := flag.Duration("idle-timeout", 90*time.Second, "Pipe idle timeout")
 	bufSize := flag.Int("buffer", 65536, "Copy buffer size in bytes")
 	maxConns := flag.Int64("max-conns", 0, "Max concurrent connections (0 = unlimited)")
-	statsInterval := flag.Duration("stats-interval", 60*time.Second, "Stats log interval (0 = disabled)")
+	// statsInterval := flag.Duration("stats-interval", 60*time.Second, "Stats log interval (0 = disabled)")
 	insecure := flag.Bool("insecure", false, "Skip TLS certificate verification (development only)")
 	flag.Parse()
 	log.SetFlags(0)
@@ -780,9 +780,9 @@ func main() {
 	}()
 
 	// --- Background stats logging ---
-	if *statsInterval > 0 {
-		go statsLoop(ctx, *statsInterval)
-	}
+	// if *statsInterval > 0 {
+	// 	go statsLoop(ctx, *statsInterval)
+	// }
 
 	var connSem chan struct{}
 	if cfg.MaxConns > 0 {

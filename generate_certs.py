@@ -57,7 +57,7 @@ now = datetime.now(timezone.utc)
 def new_key():
     return rsa.generate_private_key(public_exponent=65537, key_size=KEY_SIZE)
 
-def base_builder(subject: x509.Name, issuer: x509.Name, key, days: int):
+def base_builder(subject: x509.Name, issuer: x509.Name, key: rsa.RSAPrivateKey, days: int):
     return (
         x509.CertificateBuilder()
         .subject_name(subject)

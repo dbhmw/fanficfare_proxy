@@ -1,46 +1,50 @@
 
 import asyncio
 import typing
+import gc
+import inspect
+import sys
+import types
+import websockets
+from typing import Any
 from cdp_socket.socket import SingleCDPSocket
 from cdp_socket.exceptions import SocketExcitedError,CDPError
+from selenium_driverless.types.target import Target, TargetInfo
+from selenium_driverless.types.context import Context
+from selenium_driverless.scripts.driver_utils import add_cookie
+from selenium_driverless.webdriver import Chrome
+from selenium_driverless.types.options import Options as ChromeOptions
+from selenium_driverless import EXC_HANDLER
+
 # 1. Patch exec to aggressively clean up futures
 _orig_exec = SingleCDPSocket.exec
-async def _patched_exec(self, method: str, params: dict | None = None, timeout: float = 2):
+async def _patched_exec(self, method, params=None, timeout=2):
     _id = await self.send(method=method, params=params)
-    self._responses[_id]
     fut = self._responses[_id]
     try:
-        res = await asyncio.wait_for(fut, timeout=timeout)
-        return res
-    except asyncio.TimeoutError as e:
-        e.__traceback__ = None  # Clear traceback
+        return await asyncio.wait_for(fut, timeout=timeout)
+    except asyncio.TimeoutError:
         if self._task.done():
             if self._exc:
                 self._exc.__traceback__ = None
-                raise self._exc from None
-            elif self._task._exception:
-                self._task._exception.__traceback__ = None
-                raise self._task._exception from None
-            else:
-                raise SocketExcitedError("socket coroutine excited without exception") from None
+                raise type(self._exc)(*self._exc.args) from None
+            if self._task._exception:
+                src = self._task._exception
+                src.__traceback__ = None
+                raise type(src)(*src.args) from None
+            raise SocketExcitedError("socket coroutine exited without exception") from None
         raise asyncio.TimeoutError(
             f'got no response for method: "{method}", params: {params}'
             f"\nwithin {timeout} seconds") from None
+    except CDPError as e:
+        e.__traceback__ = None
+        raise CDPError(*e.args) from None
     finally:
         self._responses.pop(_id, None)
-        if hasattr(fut, '_callbacks') and fut._callbacks is not None:
-            fut._callbacks.clear()
-        if fut.done() and not fut.cancelled():
-            try:
-                exc = fut.exception()
-                if exc and hasattr(exc, '__traceback__'):
-                    exc.__traceback__ = None
-            except (asyncio.CancelledError, asyncio.InvalidStateError):
-                pass
+        fut = None
 SingleCDPSocket.exec = _patched_exec
 
 
-import websockets
 # 2. Patch close to clear all internal state
 _orig_close = SingleCDPSocket.close
 async def _patched_close(self, code=1000, reason=''):
@@ -53,193 +57,9 @@ async def _patched_close(self, code=1000, reason=''):
                 pass
             else:
                 raise e
-
-    if self._exc is not None:
-        if hasattr(self._exc, '__traceback__'):
-            self._exc.__traceback__ = None
-        self._exc = None
-
-    if self._task is not None:
-        if self._task.done() and not self._task.cancelled():
-            try:
-                exc = self._task.exception()
-            except (asyncio.CancelledError, asyncio.InvalidStateError):
-                exc = None
-            if exc and hasattr(exc, '__traceback__'):
-                exc.__traceback__ = None
-        self._task = None
-
-    for fut in self._responses.values():
-        if hasattr(fut, '_callbacks') and fut._callbacks is not None:
-            fut._callbacks.clear()
-        if fut.done() and not fut.cancelled():
-            try:
-                exc = fut.exception()
-            except (asyncio.CancelledError, asyncio.InvalidStateError):
-                exc = None
-            if exc and hasattr(exc, '__traceback__'):
-                exc.__traceback__ = None
-    self._responses.clear()
-
-    self._events.clear()
-    self._iter_callbacks.clear()
-    self.on_closed.clear()
 SingleCDPSocket.close = _patched_close
 
 
-# 3. Patch _rec_coro to clear exception locals after setting them on futures
-_orig_rec_coro = SingleCDPSocket._rec_coro
-async def _patched_rec_coro(self):
-    try:
-        async for data in self._ws:
-            try:
-                data = await self.load_json(data)
-            except Exception as e:
-                from cdp_socket import EXC_HANDLER
-                EXC_HANDLER(e)
-                data = {"method": "DecodeError", "params": {"e": e}}
-            err = data.get('error')
-            _id = data.get("id")
-            if err is None:
-                if _id is None:
-                    method = data.get("method")
-                    params = data.get("params")
-                    callbacks = self._events[method]
-                    for callback in callbacks:
-                        await self._handle_callback(callback, params)
-                    for _id, fut_result_setter in list(self._iter_callbacks[method].items()):
-                        try:
-                            fut_result_setter(params)
-                        except asyncio.InvalidStateError:
-                            pass
-                        try:
-                            del self._iter_callbacks[method][_id]
-                        except KeyError:
-                            pass
-                else:
-                    try:
-                        self._responses[_id].set_result(data["result"])
-                    except asyncio.InvalidStateError:
-                        try:
-                            del self._responses[_id]
-                        except KeyError:
-                            pass
-            else:
-                exc = CDPError(error=err)
-                try:
-                    self._responses[_id].set_exception(exc)
-                except asyncio.InvalidStateError:
-                    try:
-                        del self._responses[_id]
-                    except KeyError:
-                        pass
-                # THIS IS THE KEY FIX: clear the traceback and drop the local
-                exc.__traceback__ = None
-                del exc
-    except websockets.exceptions.ConnectionClosedError as e:
-        if self.on_closed:
-            self._exc = e
-            for callback in self.on_closed:
-                await self._handle_callback(callback, code=e.code, reason=e.reason)
-SingleCDPSocket._rec_coro = _patched_rec_coro
-
-
-from selenium_driverless.types.target import Target, TargetInfo
-_orig_get = Target.get
-async def _patched_get(self, url: str, referrer: str | None = None, wait_load: bool = True, timeout: float = 30):
-    if url == "about:blank":
-        wait_load = False
-    result = {}
-
-    if "#" in url:
-        current_url_base = (await self.current_url).split("#")[0]
-        if url[0] == "#":
-            url = current_url_base + url
-            wait_load = False
-        elif url.split("#")[0] == current_url_base:
-            wait_load = False
-
-    wait = None
-    get = None  # Initialize here
-    
-    try:
-        if wait_load:
-            if not self._page_enabled:
-                await self.execute_cdp_cmd("Page.enable")
-
-            from selenium_driverless.utils.utils import safe_wrap_fut
-            wait = asyncio.ensure_future(asyncio.wait([
-                safe_wrap_fut(self.wait_for_cdp("Page.loadEventFired", timeout=None)),
-                safe_wrap_fut(self.wait_download(timeout=None))
-            ], timeout=timeout, return_when=asyncio.FIRST_COMPLETED))
-
-            await asyncio.sleep(0.01)
-
-        args = {"url": url, "transitionType": "link"}
-        if referrer:
-            args["referrer"] = referrer
-        get = asyncio.ensure_future(self.execute_cdp_cmd("Page.navigate", args, timeout=timeout))
-
-        if wait_load and wait is not None:
-            done, pending = await wait
-            # Clean up all pending futures
-            for pend in pending:
-                pend.cancel()
-                try:
-                    await pend
-                except (asyncio.CancelledError, Exception):
-                    pass
-            
-            if not done:
-                # Timeout - must retrieve exception from get future
-                if not get.done():
-                    get.cancel()
-                try:
-                    await get
-                except (asyncio.CancelledError, Exception):
-                    pass
-                # Clear local refs before raising
-                get = None
-                wait = None
-                raise asyncio.TimeoutError(f'page: "{url}" didn\'t load within timeout of {timeout}') from None
-            result = done.pop().result()
-        
-        await get
-        await self._on_loaded()
-        return result
-        
-    except BaseException as e:
-        e.__traceback__ = None
-        
-        # Clean up futures
-        if get is not None and not get.done():
-            get.cancel()
-        if get is not None:
-            try:
-                await get
-            except (asyncio.CancelledError, Exception) as cleanup_exc:
-                cleanup_exc.__traceback__ = None
-        
-        if wait is not None and not wait.done():
-            wait.cancel()
-        if wait is not None:
-            try:
-                await wait
-            except (asyncio.CancelledError, Exception) as cleanup_exc:
-                cleanup_exc.__traceback__ = None
-        
-        # Delete local references BEFORE re-raising
-        get = None
-        wait = None
-        raise e from None
-    finally:
-        # Extra safety: ensure locals are cleared
-        get = None
-        wait = None
-Target.get = _patched_get
-
-
-from selenium_driverless.types.context import Context
 _orig_window_handles = Context.window_handles
 @property
 async def _patched_window_handles(self) -> list[TargetInfo]:
@@ -253,7 +73,6 @@ async def _patched_window_handles(self) -> list[TargetInfo]:
 setattr(Context, 'window_handles', _patched_window_handles)
 
 
-from selenium_driverless.scripts.driver_utils import add_cookie
 _orig_add_cookie = Target.add_cookie
 async def _patched_add_cookie(self, cookie_dict) -> None:
     if not (cookie_dict.get("url") or cookie_dict.get("domain") or cookie_dict.get("path")):
@@ -266,8 +85,6 @@ async def _patched_add_cookie(self, cookie_dict) -> None:
 Target.add_cookie = _patched_add_cookie
 
 
-from selenium_driverless.webdriver import Chrome
-from selenium_driverless.types.options import Options as ChromeOptions
 _orig_init = Chrome.__init__
 def __init(self, options: ChromeOptions = None, timeout: float = 30, debug: bool = False, max_ws_size: int = 2 ** 27) -> None:
     _orig_init(self, options=options, timeout=timeout, debug=debug, max_ws_size=max_ws_size)
@@ -283,7 +100,6 @@ async def _patched_new_context(self, proxy_bypass_list: typing.List[str] = None,
 Chrome.new_context = _patched_new_context
 
 
-from selenium_driverless import EXC_HANDLER
 async def enable_developer_mode(self, timeout: float = 10):
     """enable developer mode"""
     if not self._is_developer_mode:
@@ -311,3 +127,277 @@ async def enable_developer_mode(self, timeout: float = 10):
         self._is_developer_mode = True
         await page.close()
 setattr(Chrome, 'enable_developer_mode', enable_developer_mode)
+
+
+# Refs we describe but never recurse through — they're program structure or
+# scheduler plumbing, not live state. Climbing past a Task into the loop's
+# _ready deque, or past a function into its module, just produces noise.
+_OPAQUE_BOUNDARIES = (
+    types.ModuleType,
+    types.FunctionType,
+    types.BuiltinFunctionType,
+    types.MethodType,
+    types.MethodWrapperType,
+    types.WrapperDescriptorType,
+    types.MethodDescriptorType,
+    types.GetSetDescriptorType,
+    types.MemberDescriptorType,
+    type,
+    types.CodeType,
+    asyncio.Task,
+    asyncio.Future,
+    asyncio.Handle,
+    asyncio.TimerHandle,
+)
+
+# Pure noise from gc internals / asyncio scheduler innards.
+_TRANSIENT_TYPE_NAMES = {
+    "list_iterator", "tuple_iterator", "set_iterator",
+    "dict_keyiterator", "dict_valueiterator", "dict_itemiterator",
+    "dict_keys", "dict_values", "dict_items",
+    "TaskStepMethWrapper",
+    "_WeakSet",
+}
+async def _clear_frames(ob: Any, module_filter: str | None = None) -> int:
+        """Diagnostic refgraph + frame-local clearer.
+
+        Walks gc.get_referrers upward from `ob`, prints a tree of holders with
+        full cycle and shared-node detection, then clears any frame locals
+        that pin `ob` (skipping active coroutines).
+        """
+        if not __debug__:
+            return 0
+
+        obj_id = id(ob)
+        destroyed = 0
+
+        # ---------- diagnostic refgraph ----------
+        seen: dict[int, str] = {}      # id(node) -> "#N", also our visited set
+        cycles: int = 0
+        truncated: list[str] = []
+        MAX_NODES = 128
+        MAX_DEPTH = 32
+        MAX_REFS_PER_NODE = 16
+
+        def label_for(o: Any) -> str:
+            oid = id(o)
+            if oid in seen:
+                return seen[oid]
+            s = f"#{len(seen) + 1}"
+            seen[oid] = s
+            return s
+
+        def describe(ref: Any) -> str:
+            if isinstance(ref, types.FrameType):
+                fname = ref.f_code.co_filename.rsplit("/", 1)[-1]
+                return f"FRAME {fname}:{ref.f_lineno} in {ref.f_code.co_name}()"
+            if isinstance(ref, types.CoroutineType):
+                state_name = {
+                    inspect.CORO_CREATED: "CREATED",
+                    inspect.CORO_RUNNING: "RUNNING",
+                    inspect.CORO_SUSPENDED: "SUSPENDED",
+                    inspect.CORO_CLOSED: "CLOSED",
+                }.get(inspect.getcoroutinestate(ref), "?")
+                line = ref.cr_frame.f_lineno if ref.cr_frame else "?"
+                return (f"COROUTINE {ref.cr_code.co_qualname} "
+                        f"state={state_name} at line {line}")
+            if isinstance(ref, asyncio.Task):
+                try:
+                    name = ref.get_name()
+                except Exception:
+                    name = "?"
+                return f"TASK name={name!r} done={ref.done()}"
+            if isinstance(ref, asyncio.Future):
+                return f"FUTURE done={ref.done()}"
+            if isinstance(ref, types.MethodType):
+                holder = type(ref.__self__).__qualname__
+                return f"BOUND_METHOD {holder}.{ref.__func__.__name__}"
+            if isinstance(ref, types.FunctionType):
+                return f"FUNCTION {ref.__qualname__} (closure)"
+            if isinstance(ref, types.CellType):
+                return "CELL"
+            if isinstance(ref, types.ModuleType):
+                return f"MODULE {ref.__name__}"
+            if isinstance(ref, type):
+                return f"CLASS {ref.__qualname__}"
+            if isinstance(ref, dict):
+                return f"DICT len={len(ref)}"
+            if isinstance(ref, (list, tuple, set, frozenset)):
+                return f"{type(ref).__name__.upper()} len={len(ref)}"
+            mod = type(ref).__module__
+            qn = type(ref).__qualname__
+            return qn if mod in ("builtins", "__main__") else f"{mod}.{qn}"
+
+        def held_at(ref: Any, target_id: int) -> str:
+            """Where inside `ref` does the target live?"""
+            try:
+                if isinstance(ref, types.FrameType):
+                    names = [n for n, v in ref.f_locals.items()
+                             if id(v) == target_id]
+                    return f" vars={names}" if names else ""
+                if isinstance(ref, types.CoroutineType) and ref.cr_frame is not None:
+                    names = [n for n, v in ref.cr_frame.f_locals.items()
+                             if id(v) == target_id]
+                    return f" cr_locals={names}" if names else ""
+                if isinstance(ref, dict):
+                    keys: list[str] = []
+                    for k, v in ref.items():
+                        if id(v) == target_id:
+                            try:
+                                keys.append(repr(k))
+                            except Exception:
+                                keys.append(f"<{type(k).__name__}>")
+                            if len(keys) >= 3:
+                                break
+                    return f" at_keys={keys}" if keys else ""
+                if isinstance(ref, (list, tuple)):
+                    idx = [i for i, v in enumerate(ref) if id(v) == target_id]
+                    if len(idx) > 3:
+                        idx = idx[:3] + ["…"]
+                    return f" at_index={idx}" if idx else ""
+            except Exception:
+                pass
+            return ""
+
+        def is_scheduler_noise(target: Any, ref: Any) -> bool:
+            """Plain list/tuple chains (list-in-list, list-in-tuple) and
+            list/tuple holding a coroutine are virtually always asyncio
+            internals — collections.deque internal block lists, Handle
+            args tuples, _ready queue entries.
+
+            Real user code holds objects in lists *attached to a named
+            class instance* or *bound to a name in a frame/dict*, so the
+            list itself will be reached via that named holder, not via
+            a sibling list."""
+            if type(target) in (list, tuple) and type(ref) in (list, tuple):
+                return True
+            if isinstance(target, types.CoroutineType) and type(ref) in (list, tuple):
+                return True
+            return False
+
+        def is_uninteresting(ref: Any) -> bool:
+            """Refs we describe but don't recurse through."""
+            if isinstance(ref, _OPAQUE_BOUNDARIES):
+                return True
+            if type(ref).__name__ in _TRANSIENT_TYPE_NAMES:
+                return True
+            return False
+
+        # Identify our own coroutine(s) so we don't list ourselves as a
+        # referrer. asyncio.current_task().get_coro() returns the Task's
+        # *outermost* coroutine, which is wrong when we're called inside
+        # an awaited helper — match by code object instead.
+        own_code = sys._getframe(0).f_code
+
+        def should_skip_entirely(ref: Any) -> bool:
+            """Refs we don't even mention — pure gc noise / ourselves."""
+            if type(ref).__name__ in _TRANSIENT_TYPE_NAMES:
+                return True
+            if isinstance(ref, types.FrameType):
+                if ref.f_code in _walker_codes or ref.f_code is own_code:
+                    return True
+            if isinstance(ref, types.CoroutineType) and ref.cr_code is own_code:
+                return True
+            return False
+
+        def walk(target: Any, depth: int, on_path: set[int]) -> None:
+            if len(seen) >= MAX_NODES:
+                truncated.append(f"node-cap reached at depth {depth}")
+                return
+            if depth > MAX_DEPTH:
+                truncated.append(f"depth-cap at {describe(target)[:60]}")
+                return
+
+            tid = id(target)
+            on_path.add(tid)
+            try:
+                referrers = gc.get_referrers(target)
+                referrers_id = id(referrers)  # exclude this transient list
+
+                shown = 0
+                hidden = 0
+                for ref in referrers:
+                    if id(ref) == referrers_id:
+                        continue
+                    if should_skip_entirely(ref):
+                        continue
+                    if is_scheduler_noise(target, ref):
+                        continue
+
+                    if shown >= MAX_REFS_PER_NODE:
+                        hidden += 1
+                        continue
+
+                    rid = id(ref)
+                    indent = "  " * depth
+                    desc = describe(ref)
+                    where = held_at(ref, tid)
+
+                    nonlocal cycles
+                    if rid in on_path:
+                        cycles += 1
+                        back_to = seen.get(tid, "?")
+                        print(f"{indent}↺ CYCLE → back to {back_to}: {desc}{where}")
+                        continue
+                    if rid in seen:
+                        print(f"{indent}↗ shared {seen[rid]}: {desc}{where}")
+                        continue
+
+                    lbl = label_for(ref)
+                    print(f"{indent}{lbl} ← {desc}{where}")
+                    shown += 1
+
+                    if not is_uninteresting(ref):
+                        walk(ref, depth + 1, on_path)
+
+                if hidden:
+                    print(f"{'  ' * depth}… +{hidden} more referrers (capped)")
+            finally:
+                on_path.discard(tid)
+
+        _walker_codes = {
+            walk.__code__, describe.__code__, held_at.__code__,
+            label_for.__code__, is_uninteresting.__code__,
+            should_skip_entirely.__code__, is_scheduler_noise.__code__,
+        }
+
+        rc = sys.getrefcount(ob) - 1
+        print(f"--- Refgraph for {type(ob).__qualname__} "
+              f"id={obj_id} refcount={rc} ---")
+        label_for(ob)
+        print(f"#1 ROOT {type(ob).__module__}.{type(ob).__qualname__}")
+        walk(ob, 1, set())
+        print(f"--- {len(seen)} nodes, {cycles} cycle edge(s), "
+              f"{len(truncated)} truncation(s) ---")
+        for t in truncated[:5]:
+            print(f"    truncated: {t}")
+
+        # ---------- frame-local clearing (original behaviour) ----------
+        active_frames: set[types.FrameType] = set()
+        for task in asyncio.all_tasks():
+            coro = getattr(task, "_coro", None)
+            while coro is not None:
+                frame = getattr(coro, "cr_frame", None)
+                if frame is not None:
+                    active_frames.add(frame)
+                coro = getattr(coro, "cr_await", None)
+
+        for frame_obj in gc.get_referrers(ob):
+            if not isinstance(frame_obj, types.FrameType):
+                continue
+            if module_filter and module_filter not in frame_obj.f_code.co_filename:
+                continue
+            if frame_obj in active_frames:
+                continue
+            if frame_obj.f_code in _walker_codes or frame_obj.f_code is own_code:
+                continue
+            try:
+                for var_name, var_value in frame_obj.f_locals.items():
+                    if id(var_value) == obj_id:
+                        print(f"Clearing frame {frame_obj.f_code.co_name}:{frame_obj.f_lineno} var={var_name}")
+                        frame_obj.f_locals[var_name] = None
+                        destroyed += 1
+                        break
+            except Exception as e:
+                print(f"Error nuking frame: {str(e)}")
+        return destroyed

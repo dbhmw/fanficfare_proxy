@@ -184,8 +184,8 @@ class SidecarManager:
         self._process: Optional[asyncio.subprocess.Process] = None
         self._addr: Optional[str] = None
         self._bound_name: Optional[str] = None  # remembered for restart
-        self._monitor_task: Optional[asyncio.Task] = None
-        self._io_tasks: list[asyncio.Task] = []  # stdout/stderr forwarders
+        self._monitor_task: Optional[asyncio.Task[None]] = None
+        self._io_tasks: list[asyncio.Task[None]] = []  # stdout/stderr forwarders
         self._stopping = False
         self._restart_count = 0
         self._started_at: Optional[float] = None
@@ -409,7 +409,6 @@ class SidecarManager:
             "--listen", name,
             "--connect-timeout", f"{self.connect_timeout}s",
             "--idle-timeout", f"{self.idle_timeout}s",
-            "--stats-interval", f"{self.stats_interval}s",
         ]
         if self.max_conns > 0:
             args.extend(["--max-conns", str(self.max_conns)])
@@ -443,7 +442,7 @@ class SidecarManager:
 
         # Start stderr forwarder (Go's log.Printf writes to stderr)
         stderr_task = asyncio.create_task(
-            self._forward_stream(self._process.stderr, "[sidecar]"), name="sidecar-stderr"
+            self._forward_stream(self._process.stderr), name="sidecar-stderr"
         )
         self._io_tasks.append(stderr_task)
 
@@ -491,7 +490,7 @@ class SidecarManager:
                 logger.debug("Sidecar signaled READY on %s", addr)
                 # Continue forwarding remaining stdout in background
                 stdout_task = asyncio.create_task(
-                    self._forward_stream(self._process.stdout, "[sidecar:stdout]"), name="sidecar-stdout"
+                    self._forward_stream(self._process.stdout), name="sidecar-stdout"
                 )
                 self._io_tasks.append(stdout_task)
                 return addr
@@ -520,7 +519,7 @@ class SidecarManager:
 
         return reader, writer
 
-    async def _forward_stream(self, stream: Optional[asyncio.StreamReader], prefix: str) -> None:
+    async def _forward_stream(self, stream: Optional[asyncio.StreamReader]) -> None:
         """Forward a subprocess stream line-by-line to the Python logger."""
         if stream is None:
             return
@@ -528,7 +527,7 @@ class SidecarManager:
             async for line in stream:
                 decoded = line.decode("utf-8", errors="replace").rstrip()
                 if decoded:
-                    logger.debug("%s %s", prefix, decoded)
+                    logger.debug(decoded)
         except asyncio.CancelledError:
             pass
         except Exception:

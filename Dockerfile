@@ -10,30 +10,24 @@ RUN pacman -Syu --noconfirm && \
     go \
     uv \
     xorg-server-xvfb \
-    xorg-setxkbmap \
-    xorg-xrandr \
     xkeyboard-config \
-    xorg-xinit \
     libx11 \
     libxext \
-    libxrender \
     libxtst \
     ca-certificates \
     wget \
     tar \
     nss \
-    nspr \
     at-spi2-core \
     libcups \
     libxcomposite \
     libxdamage \
     libxrandr \
     mesa \
-    alsa-lib \
     libxshmfence \
     libxkbcommon \
-    cairo \
     pango \
+    alsa-lib \
     && pacman -Scc --noconfirm
 
 # Create non-root user
