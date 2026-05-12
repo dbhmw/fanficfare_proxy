@@ -47,6 +47,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import signal
 import time
 import os
@@ -65,6 +66,80 @@ def set_sidecar_log_level(level: int) -> None:
         Standard ``logging`` level (``logging.DEBUG``, ``logging.INFO``, …).
     """
     logger.setLevel(level)
+
+
+# ── Sidecar (Go) → Python log bridging ────────────────────────────────────
+#
+# The Go sidecar emits each log line in the form
+#
+#     LOG|<LEVEL>|<funcname>|<lineno>|<message>
+#
+# where <funcname> and <lineno> identify the *Go* call site that produced
+# the message (captured via runtime.Caller).  ``_emit_from_sidecar`` parses
+# these lines and forwards them through this module's logger with
+# ``funcName``/``lineno`` overridden, so a downstream Python ``Formatter``
+# of the shape ``%(levelname)s | %(filename)s | %(funcName)s[%(lineno)d]``
+# renders Go log lines as though they came from this file.  Lines that
+# don't match the expected format fall back to DEBUG so anything the Go
+# runtime writes outside our control (panics, stack traces, etc.) is
+# still visible.
+
+_GO_LOG_RE = re.compile(
+    r"^LOG\|(?P<level>[A-Z]+)\|(?P<func>[^|]+)\|(?P<line>\d+)\|(?P<msg>.*)$"
+)
+
+# Map Go-side level names to Python logging levels.  WARN and ERR are the
+# short forms the Go code uses; the canonical Python spellings are kept
+# as aliases for forward compatibility.
+_GO_LEVELS = {
+    "DEBUG":   logging.DEBUG,
+    "INFO":    logging.INFO,
+    "WARN":    logging.WARNING,
+    "WARNING": logging.WARNING,
+    "ERR":     logging.ERROR,
+    "ERROR":   logging.ERROR,
+    "FATAL":   logging.CRITICAL,
+    "CRITICAL": logging.CRITICAL,
+}
+
+
+def _emit_from_sidecar(line: str) -> None:
+    """Re-emit a Go sidecar log line as a native Python ``LogRecord``.
+
+    The Go ``logf`` helper writes lines of the form
+    ``LOG|LEVEL|funcname|lineno|message``.  We parse those, look up the
+    matching Python level, and construct a ``LogRecord`` manually so the
+    standard formatter renders ``funcName`` and ``lineno`` as the Go
+    call site rather than this Python function.
+
+    Parameters
+    ----------
+    line:
+        A single line of text from the sidecar's stderr/stdout (already
+        stripped of trailing newlines).
+    """
+    m = _GO_LOG_RE.match(line)
+    if m is None:
+        # Unrecognised line (Go runtime output, panics, etc.) — surface
+        # it at DEBUG so it's still discoverable without polluting INFO.
+        logger.debug(line)
+        return
+
+    level = _GO_LEVELS.get(m["level"], logging.DEBUG)
+    if not logger.isEnabledFor(level):
+        return
+
+    record = logger.makeRecord(
+        name=logger.name,
+        level=level,
+        fn=__file__,         # pathname → %(filename)s == "sidecar.py"
+        lno=int(m["line"]),  # Go call-site line number
+        msg=m["msg"],
+        args=(),
+        exc_info=None,
+        func=m["func"],      # Go call-site function name
+    )
+    logger.handle(record)
 
 
 # ── Known stat fields — guards against new Go-side fields breaking us ──
@@ -500,7 +575,7 @@ class SidecarManager:
                 raise RuntimeError(f"Sidecar startup error: {msg}")
 
             # Unexpected pre-READY output — log and continue waiting
-            logger.debug("[sidecar:stdout] %s", decoded)
+            _emit_from_sidecar(decoded)
 
     async def _connect(self, timeout: float = 5.0) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
         """Open a connection to the sidecar via abstract namespace UDS."""
@@ -520,14 +595,20 @@ class SidecarManager:
         return reader, writer
 
     async def _forward_stream(self, stream: Optional[asyncio.StreamReader]) -> None:
-        """Forward a subprocess stream line-by-line to the Python logger."""
+        """Forward a subprocess stream line-by-line to the Python logger.
+
+        Lines emitted by the Go sidecar's ``logf`` helper are parsed back
+        into native ``LogRecord``s so they appear in logs as though they
+        came from this module (with the Go call-site as funcName/lineno).
+        Anything else (Go runtime output, panics) is forwarded as DEBUG.
+        """
         if stream is None:
             return
         try:
             async for line in stream:
                 decoded = line.decode("utf-8", errors="replace").rstrip()
                 if decoded:
-                    logger.debug(decoded)
+                    _emit_from_sidecar(decoded)
         except asyncio.CancelledError:
             pass
         except Exception:

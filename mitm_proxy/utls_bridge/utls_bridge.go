@@ -183,6 +183,42 @@ func (m *Metrics) Snapshot() StatsSnapshot {
 var metrics = Metrics{StartTime: time.Now()}
 
 // ---------------------------------------------------------------------------
+// Structured logging — emitted in a form the Python sidecar manager
+// re-emits as native LogRecords (preserving level + caller info).
+// ---------------------------------------------------------------------------
+
+// logf emits a log line carrying level, caller function, caller line,
+// and message — pipe-separated so the Python side can parse it back into
+// a LogRecord whose funcName/lineno match the Go call site.
+//
+// Format:  LOG|<LEVEL>|<func>|<line>|<message>
+//
+// Pipe is chosen as the separator because Go log messages here never
+// contain it.  runtime.Caller(1) captures the immediate caller (the
+// actual log site, not this helper).  The package prefix is trimmed so
+// "main.dialSOCKS5" becomes "dialSOCKS5", matching what Python's
+// formatter would render for a real Python function.
+//
+// Newlines in the message are flattened to spaces so each LOG line on
+// stderr corresponds to exactly one Python LogRecord.
+func logf(level, format string, args ...any) {
+	fn, line := "?", 0
+	if pc, _, ln, ok := runtime.Caller(1); ok {
+		line = ln
+		if f := runtime.FuncForPC(pc); f != nil {
+			name := f.Name()
+			if i := strings.LastIndex(name, "."); i >= 0 {
+				name = name[i+1:]
+			}
+			fn = name
+		}
+	}
+	msg := fmt.Sprintf(format, args...)
+	msg = strings.ReplaceAll(msg, "\n", " ")
+	log.Printf("LOG|%s|%s|%d|%s", level, fn, line, msg)
+}
+
+// ---------------------------------------------------------------------------
 // SOCKS5 dialer
 // ---------------------------------------------------------------------------
 
@@ -213,7 +249,7 @@ func dialSOCKS5(ctx context.Context, proxyAddr, targetHost string, targetPort in
 		d.Timeout = 15 * time.Second
 	}
 
-	log.Printf("[DEBUG] socks5: dialing proxy %s for target %s:%d", proxyAddr, targetHost, targetPort)
+	logf("DEBUG", "socks5: dialing proxy %s for target %s:%d", proxyAddr, targetHost, targetPort)
 	conn, err := d.DialContext(ctx, "tcp", proxyAddr)
 	if err != nil {
 		return nil, fmt.Errorf("socks5 dial %s: %w", proxyAddr, err)
@@ -236,7 +272,7 @@ func dialSOCKS5(ctx context.Context, proxyAddr, targetHost string, targetPort in
 	}
 	if resp[0] != 0x05 || resp[1] == 0xFF {
 		conn.Close()
-		log.Printf("[WARN] socks5: proxy %s rejected auth method for %s:%d", proxyAddr, targetHost, targetPort)
+		logf("WARN", "socks5: proxy %s rejected auth method for %s:%d", proxyAddr, targetHost, targetPort)
 		return nil, errors.New("socks5: no acceptable auth method")
 	}
 
@@ -277,7 +313,7 @@ func dialSOCKS5(ctx context.Context, proxyAddr, targetHost string, targetPort in
 		if msg == "" {
 			msg = fmt.Sprintf("unknown error code %d", respHdr[1])
 		}
-		log.Printf("[WARN] socks5: proxy %s CONNECT to %s:%d failed: %s (code=0x%02x)",
+		logf("WARN", "socks5: proxy %s CONNECT to %s:%d failed: %s (code=0x%02x)",
 			proxyAddr, targetHost, targetPort, msg, respHdr[1])
 		return nil, fmt.Errorf("socks5: %s", msg)
 	}
@@ -308,7 +344,7 @@ func dialSOCKS5(ctx context.Context, proxyAddr, targetHost string, targetPort in
 	// the caller's TLS handshake, which sets its own deadlines.
 	conn.SetDeadline(time.Time{})
 	metrics.SOCKSConns.Add(1)
-	log.Printf("[DEBUG] socks5: tunnel established via %s to %s:%d", proxyAddr, targetHost, targetPort)
+	logf("DEBUG", "socks5: tunnel established via %s to %s:%d", proxyAddr, targetHost, targetPort)
 	return conn, nil
 }
 
@@ -332,7 +368,7 @@ func dialSOCKS5(ctx context.Context, proxyAddr, targetHost string, targetPort in
 // error.  On error the connection is closed and the caller must NOT
 // close it again (utls.UConn.Close releases internal state).
 func chromeHandshake(ctx context.Context, conn net.Conn, hostname string, insecure bool) (*tls.UConn, string, error) {
-	log.Printf("[DEBUG] tls: starting Chrome handshake with %s", hostname)
+	logf("DEBUG", "tls: starting Chrome handshake with %s", hostname)
 	uconn := tls.UClient(conn, &tls.Config{
 		ServerName:         hostname,
 		InsecureSkipVerify: insecure,
@@ -345,7 +381,7 @@ func chromeHandshake(ctx context.Context, conn net.Conn, hostname string, insecu
 
 	if err := uconn.Handshake(); err != nil {
 		metrics.TLSErrors.Add(1)
-		log.Printf("[WARN] tls: handshake failed with %s: %v", hostname, err)
+		logf("WARN", "tls: handshake failed with %s: %v", hostname, err)
 		uconn.Close() // releases utls internal state + underlying conn
 		return nil, "", fmt.Errorf("tls handshake %s: %w", hostname, err)
 	}
@@ -359,7 +395,7 @@ func chromeHandshake(ctx context.Context, conn net.Conn, hostname string, insecu
 	if alpn == "" {
 		alpn = "http/1.1" // no ALPN negotiated → assume HTTP/1.1
 	}
-	log.Printf("[DEBUG] tls: handshake complete with %s: alpn=%s resumed=%v version=0x%04x cipher=0x%04x",
+	logf("DEBUG", "tls: handshake complete with %s: alpn=%s resumed=%v version=0x%04x cipher=0x%04x",
 		hostname, alpn, state.DidResume, state.Version, state.CipherSuite)
 	return uconn, alpn, nil
 }
@@ -390,10 +426,10 @@ func handleConn(conn net.Conn, cfg Config) {
 		// ErrBufferFull means line exceeded maxCommandLineLen — reject.
 		// Any other error (EOF, timeout) also means we can't proceed.
 		if errors.Is(err, bufio.ErrBufferFull) {
-			log.Printf("[WARN] handleConn: command line exceeded %d bytes from %s", maxCommandLineLen, conn.RemoteAddr())
+			logf("WARN", "handleConn: command line exceeded %d bytes from %s", maxCommandLineLen, conn.RemoteAddr())
 			writeResp(conn, cfg, "ERR command line too long\n")
 		} else {
-			log.Printf("[DEBUG] handleConn: read error from %s: %v", conn.RemoteAddr(), err)
+			logf("DEBUG", "handleConn: read error from %s: %v", conn.RemoteAddr(), err)
 		}
 		conn.Close()
 		return
@@ -427,7 +463,7 @@ func handleConn(conn net.Conn, cfg Config) {
 			metrics.ActiveConns.Add(-1)
 
 		default:
-			log.Printf("[WARN] handleConn: unknown command %q from %s", fields[0], conn.RemoteAddr())
+			logf("WARN", "handleConn: unknown command %q from %s", fields[0], conn.RemoteAddr())
 			writeResp(conn, cfg, fmt.Sprintf("ERR unknown command: %s\n", fields[0]))
 			conn.Close()
 	}
@@ -521,22 +557,22 @@ func doConnect(conn net.Conn, reader *bufio.Reader, fields []string, cfg Config)
 
     var targetConn net.Conn
     if socksProxy != "" {
-        log.Printf("[INFO] connect: %s via socks5://%s", target, socksProxy)
+        logf("INFO", "connect: %s via socks5://%s", target, socksProxy)
         targetConn, err = dialSOCKS5(ctx, socksProxy, host, port)
     } else {
-        log.Printf("[INFO] connect: %s (direct)", target)
+        logf("INFO", "connect: %s (direct)", target)
         targetConn, err = (&net.Dialer{}).DialContext(ctx, "tcp",
             net.JoinHostPort(host, fmt.Sprintf("%d", port)))
     }
     if err != nil {
-        log.Printf("[WARN] connect: dial %s failed: %v", target, err)
+        logf("WARN", "connect: dial %s failed: %v", target, err)
         writeResp(conn, cfg, fmt.Sprintf("ERR %s\n", err))
         return
     }
 
     tlsConn, alpn, err := chromeHandshake(ctx, targetConn, host, cfg.Insecure)
     if err != nil {
-        log.Printf("[WARN] connect: TLS failed for %s: %v", target, err)
+        logf("WARN", "connect: TLS failed for %s: %v", target, err)
         writeResp(conn, cfg, fmt.Sprintf("ERR %s\n", err))
         return  // chromeHandshake already closed targetConn
     }
@@ -547,7 +583,7 @@ func doConnect(conn net.Conn, reader *bufio.Reader, fields []string, cfg Config)
     }()
 
     if err := writeResp(conn, cfg, fmt.Sprintf("OK %s\n", alpn)); err != nil {
-        log.Printf("[WARN] connect: failed to send OK to client for %s: %v", target, err)
+        logf("WARN", "connect: failed to send OK to client for %s: %v", target, err)
         return
     }
 
@@ -555,9 +591,9 @@ func doConnect(conn net.Conn, reader *bufio.Reader, fields []string, cfg Config)
         buf := make([]byte, reader.Buffered())
         n, _ := reader.Read(buf)
         if n > 0 {
-            log.Printf("[DEBUG] connect: flushing %d buffered bytes to %s", n, target)
+            logf("DEBUG", "connect: flushing %d buffered bytes to %s", n, target)
             if _, err := tlsConn.Write(buf[:n]); err != nil {
-                log.Printf("[WARN] connect: flush to %s failed: %v", target, err)
+                logf("WARN", "connect: flush to %s failed: %v", target, err)
                 return
             }
         }
@@ -566,10 +602,10 @@ func doConnect(conn net.Conn, reader *bufio.Reader, fields []string, cfg Config)
     // Transfer ownership to pipe() — nil out so defers don't close.
     c, t := conn, tlsConn
     conn, tlsConn = nil, nil
-    log.Printf("[INFO] connect: pipe started for %s (alpn=%s active=%d)",
+    logf("INFO", "connect: pipe started for %s (alpn=%s active=%d)",
         target, alpn, metrics.ActiveConns.Load())
     pipe(c, t, cfg)
-    log.Printf("[INFO] connect: pipe closed for %s (active=%d)",
+    logf("INFO", "connect: pipe closed for %s (active=%d)",
         target, metrics.ActiveConns.Load()-1)
 }
 
@@ -627,13 +663,13 @@ func pipe(client, target net.Conn, cfg Config) {
 				// blocking the copy loop indefinitely.
 				dst.SetWriteDeadline(time.Now().Add(cfg.PipeWriteTimeout))
 				if _, werr := dst.Write(buf[:n]); werr != nil {
-					log.Printf("[DEBUG] pipe: write error [%s]: %v", label, werr)
+					logf("DEBUG", "pipe: write error [%s]: %v", label, werr)
 					break
 				}
 			}
 			if err != nil {
 				if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
-					log.Printf("[DEBUG] pipe: read error [%s]: %v", label, err)
+					logf("DEBUG", "pipe: read error [%s]: %v", label, err)
 				}
 				break
 			}
@@ -657,7 +693,7 @@ func pipe(client, target net.Conn, cfg Config) {
 		// Normal path — one direction finished.
 	case <-cfg.ShutdownCh:
 		// Shutdown requested — break out of the pipe immediately.
-		log.Printf("[INFO] shutdown: closing active pipe")
+		logf("INFO", "shutdown: closing active pipe")
 	}
 
 	// Use TCP half-close where available to avoid racing
@@ -688,7 +724,7 @@ func pipe(client, target net.Conn, cfg Config) {
 	case <-done:
 		// Clean exit
 	case <-time.After(10 * time.Second):
-		log.Printf("[WARN] pipe goroutine drain timed out (10s)")
+		logf("WARN", "pipe goroutine drain timed out (10s)")
 	}
 }
 
@@ -751,7 +787,7 @@ func main() {
 	}
 
 	if cfg.Insecure {
-		log.Println("[WARN] *** TLS CERTIFICATE VERIFICATION DISABLED (--insecure) ***")
+		logf("WARN", "*** TLS CERTIFICATE VERIFICATION DISABLED (--insecure) ***")
 	}
 
 	sockName := "\x00" + cfg.ListenAddr
@@ -767,14 +803,14 @@ func main() {
 	fmt.Printf("READY %s\n", boundAddr)
 	os.Stdout.Sync()
 
-	log.Printf("TLS sidecar on %s (abstract UDS, Chrome fingerprint, utls)", boundAddr)
+	logf("INFO", "TLS sidecar on %s (abstract UDS, Chrome fingerprint, utls)", boundAddr)
 
 	// --- Graceful shutdown on SIGTERM/SIGINT ---
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	go func() {
 		<-ctx.Done()
-		log.Println("Shutting down...")
+		logf("INFO", "Shutting down...")
 		close(shutdownCh) // interrupt active pipe sessions (FIX #9)
 		ln.Close()        // causes Accept() to return an error
 	}()
@@ -796,7 +832,7 @@ func main() {
 			if ctx.Err() != nil {
 				break // shutdown signal received
 			}
-			log.Printf("[ERR] accept: %v", err)
+			logf("ERROR", "accept: %v", err)
 			continue
 		}
 
@@ -806,7 +842,7 @@ func main() {
 				case connSem <- struct{}{}:
 					// Acquired — will be released when handleConn returns.
 				default:
-					log.Printf("[WARN] accept: max connections (%d) reached, rejecting %s",
+					logf("WARN", "accept: max connections (%d) reached, rejecting %s",
 						cfg.MaxConns, conn.RemoteAddr())
 					writeResp(conn, cfg, "ERR max connections reached\n")
 					conn.Close()
@@ -828,7 +864,7 @@ func main() {
 	}
 
 	// --- Drain active connections ---
-	log.Printf("Draining %d active connections...", metrics.ActiveConns.Load())
+	logf("INFO", "Draining %d active connections...", metrics.ActiveConns.Load())
 	done := make(chan struct{})
 	go func() {
 		wg.Wait()
@@ -836,8 +872,8 @@ func main() {
 	}()
 	select {
 	case <-done:
-		log.Println("Clean shutdown")
+		logf("INFO", "Clean shutdown")
 	case <-time.After(5 * time.Second):
-		log.Printf("Force exit with %d active connections", metrics.ActiveConns.Load())
+		logf("WARN", "Force exit with %d active connections", metrics.ActiveConns.Load())
 	}
 }

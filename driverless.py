@@ -241,7 +241,7 @@ class Init:
         logger.setLevel(self.log_lvl)
         ch.setLevel(self.log_lvl)
         set_proxy_log_level(self.log_lvl)
-        set_sidecar_log_level(logging.INFO)
+        set_sidecar_log_level(self.log_lvl)
 
     def config_ini(self) -> None: # ConfigDict:
         self.port: int = (
@@ -576,7 +576,7 @@ class ProxyServer:
                     drivenbrowser_ref.in_use -= 1
                     await drivenbrowser_ref.destroy_tab(reqid)
                 if client:
-                    # await _clear_frames(client)
+                    logger.debug(sys.getrefcount(client))
                     del client
                     logger.debug("Deleted the client %s", request["session"])
 
@@ -1366,7 +1366,7 @@ class DrivenBrowser:
         del self.context
         await self.socks5_shutdown()
         del self.config
-        logger.debug("Terminated session: %s", self.session)
+        logger.info("Terminated session: %s", self.session)
         return None
 
 class ClientRequest:
@@ -1725,7 +1725,7 @@ class ClientRequest:
             if image == "True":
                 await self.drivenbrowser.set_intercept_rule(set(self.links),
                     [('Sec-Fetch-Dest', 'image'), ('Sec-Fetch-Mode', 'no-cors'), ('Sec-Fetch-Site', 'cross-site'),
-                    ('Accept', 'image/avif,image/webp,image/png,image/svg+xml,image/*;q=0.8,*/*;q=0.5'), ('Priority', 'u=5, i')])
+                    ('Accept', 'image/avif,image/webp,image/apng,image/svg+xml,image/*;q=0.8'), ('Priority', 'u=5, i')])
 
             try:
                 logger.info("URL: %s | Referer: %s", self.links[0], str(referer))
@@ -1826,7 +1826,7 @@ class ClientRequest:
             await asyncio.gather(*(tab.add_cookie(cookie) for cookie in request["cookies"]))
 
         for attempt in range(0, 5):
-            logger.info("Attempt %s for %s", str(attempt), request['session'])
+            logger.info("Attempt %s for %s [%s]", str(attempt), request['session'], request["url"])
             try:
                 if request["method"] == "GET":
                     result = await asyncio.wait_for(self.driverless_get(tab=tab, url=request["url"], headers=request["headers"], image=request["image"]),
