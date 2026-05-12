@@ -25,7 +25,6 @@ from __future__ import annotations
 import asyncio
 import time
 import traceback
-import weakref
 from typing import TYPE_CHECKING, Callable, Optional
 
 import h2.config
@@ -212,9 +211,12 @@ class Http2Handler:
     __slots__ = ("config", "_proxy")
 
     def __init__(self, proxy: SessionProxy, config: ProxyConfig = DEFAULT_CONFIG):
-        # weakref.proxy: the SessionProxy owns us (via _ProxyHandler);
-        # we don't keep it alive.  Attribute access is transparent.
-        self._proxy = weakref.proxy(proxy)
+        # Strong reference.  See _ProxyHandler.__init__ in session.py for
+        # the lifetime contract: SessionProxy.stop() awaits every handler
+        # task (registered in SessionProxy._tasks) before clearing
+        # ``self._handler``, so handler code can rely on ``self._proxy``
+        # being alive for the entire duration of its task.
+        self._proxy = proxy
         self.config = config
 
     async def handle(

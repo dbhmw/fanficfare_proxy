@@ -20,9 +20,8 @@ import asyncio
 import socket as _socket
 import threading
 import traceback
-import weakref
 from asyncio import StreamReader, StreamWriter
-from typing import Optional, Sequence
+from typing import Coroutine, Optional, Sequence
 from urllib.parse import urlparse
 
 import h2.connection
@@ -41,7 +40,7 @@ from ._io import (
     SocksProxyPool,
     TLSInterceptor,
 )
-from ._policy import DefaultPolicy, RequestPolicy
+from ._policy import DefaultPolicy, Policy
 from ._http1 import Http1Handler
 from ._http2 import Http2Handler
 
@@ -58,63 +57,35 @@ class _ProxyHandler:
     def __init__(
         self, proxy: SessionProxy, tls: TLSInterceptor, config: ProxyConfig
     ):
-        # weakref.proxy: the SessionProxy owns us (via SessionProxy._handler);
-        # we don't keep it alive.  Attribute access is transparent.
-        self._proxy = weakref.proxy(proxy)
+        # Strong reference.  ``SessionProxy.stop()`` is the single
+        # end-of-life moment: it closes the listening server, then awaits
+        # every in-flight handler task (registered via ``_spawn``), then
+        # drops ``self._handler``.  By the time the SessionProxy becomes
+        # eligible for collection, no handler is observably running, so
+        # no handler can witness a "destroyed proxy".  The cycle
+        # SessionProxy → _ProxyHandler → _proxy is broken in stop() by
+        # clearing ``self._handler``.
+        self._proxy = proxy
         self.tls = tls
         self.config = config
-        # The Http1/Http2 handlers also take a weakref to ``proxy`` (they
-        # convert internally), so we pass the strong ``proxy`` here.
         self.http1 = Http1Handler(proxy, config)
         self.http2 = Http2Handler(proxy, config)
-
-    def _safe_untrack(self, conn: ManagedConnection) -> None:
-        """Untrack a connection, tolerating a destroyed proxy.
-
-        Cleanup paths run during shutdown can race with
-        ``SessionProxy.stop()``: the strong reference dies, our weakref
-        becomes invalid, and any access raises ``ReferenceError``.
-        Cascading those errors through ``finally`` blocks produces ugly
-        stack traces and (worse) prevents the connection from being
-        closed.  When the proxy is gone, untracking is a no-op anyway —
-        nothing exists to untrack from.
-        """
-        try:
-            self._proxy._untrack_connection(conn)
-        except ReferenceError:
-            pass
-
-    def _safe_track(self, conn: ManagedConnection) -> bool:
-        """Track a connection, returning False if the proxy is gone.
-
-        Caller should treat False as "give up and close the connection
-        immediately" — the SessionProxy owning us has been destroyed and
-        any further work is wasted.
-        """
-        try:
-            self._proxy._track_connection(conn)
-            return True
-        except ReferenceError:
-            return False
-
-    def _safe_deliver_connect_error(
-        self, host: str, port: int, exc: Exception
-    ) -> None:
-        """Forward a connect error to the proxy, tolerating a destroyed proxy."""
-        try:
-            self._proxy._deliver_connect_error(host, port, exc)
-        except ReferenceError:
-            pass
 
     async def handle_client(
         self, reader: StreamReader, writer: StreamWriter
     ) -> None:
         """Entry point for each new browser connection (called by ``asyncio.Server``)."""
+        # Register the current connection task with the SessionProxy so
+        # ``stop()`` can await it.  ``_spawn`` (used by start()) also
+        # registers the task on creation; calling _register_task here is
+        # idempotent (set semantics) and also covers the case where
+        # start_server invokes us directly.
+        task = asyncio.current_task()
+        if task is not None:
+            self._proxy._register_task(task)
+
         client = ManagedConnection(reader, writer)
-        if not self._safe_track(client):
-            # Proxy died before we could even register the connection.
-            await client.close()
-            return
+        self._proxy._track_connection(client)
 
         try:
             req = await self.http1._read_request(client)
@@ -133,10 +104,13 @@ class _ProxyHandler:
 
         except asyncio.TimeoutError:
             pass
+        except asyncio.CancelledError:
+            # Shutdown-initiated; let it propagate after cleanup.
+            raise
         except Exception:
             logger.debug("Client handler error: %s", traceback.format_exc())
         finally:
-            self._safe_untrack(client)
+            self._proxy._untrack_connection(client)
             await client.close()
 
     # -- plain HTTP --------------------------------------------------------
@@ -194,13 +168,10 @@ class _ProxyHandler:
                 return
 
             target = await self._connect_to_target(host, port)
-            self._safe_track(target)
+            self._proxy._track_connection(target)
             display_host = f"{host}:{port}" if port != 80 else host
 
-            try:
-                socks = self._proxy.socks_proxy
-            except ReferenceError:
-                socks = None
+            socks = self._proxy.socks_proxy
             logger.trace(
                 "[REQ] %s http://%s%s via %s",
                 method,
@@ -228,7 +199,7 @@ class _ProxyHandler:
             )
         finally:
             if target:
-                self._safe_untrack(target)
+                self._proxy._untrack_connection(target)
                 await target.close()
 
     # -- CONNECT -----------------------------------------------------------
@@ -281,29 +252,22 @@ class _ProxyHandler:
             await client.writer.drain()
             client.writer.transport.pause_reading() # type: ignore
 
-            # Step 2: Connect to target, learn its protocol.  Read
-            # ``self._proxy.sidecar`` defensively because the proxy
-            # may have been destroyed between when we accepted the
-            # CONNECT and when we get here.
-            try:
-                use_sidecar = self._proxy.sidecar is not None
-            except ReferenceError:
-                # Proxy gone; tear down silently.
-                return
+            # Step 2: Connect to target, learn its protocol.
+            use_sidecar = self._proxy.sidecar is not None
 
             if use_sidecar:
                 target_tls, target_protocol = (
                     await self._connect_via_sidecar(host, port)
                 )
-                self._safe_track(target_tls)
+                self._proxy._track_connection(target_tls)
             else:
                 target = await self._connect_to_target(host, port)
-                self._safe_track(target)
+                self._proxy._track_connection(target)
 
                 target_tls, target_protocol = await self._start_tls(
                     target, side="target", hostname=host,
                 )
-                self._safe_track(target_tls)
+                self._proxy._track_connection(target_tls)
 
             # Step 3: Browser MITM TLS with matching protocol
             if target_protocol == Protocol.HTTP2:
@@ -314,7 +278,7 @@ class _ProxyHandler:
             client_tls, protocol = await self._start_tls(
                 client, side="client", hostname=host, alpn=browser_alpn,
             )
-            self._safe_track(client_tls)
+            self._proxy._track_connection(client_tls)
 
             # Step 4: Proxy traffic
             if protocol == Protocol.HTTP2:
@@ -326,14 +290,14 @@ class _ProxyHandler:
 
         except asyncio.TimeoutError:
             logger.warning("[%s:%d] Timeout", host, port)
-            self._safe_deliver_connect_error(
+            self._proxy._deliver_connect_error(
                 host,
                 port,
                 TimeoutError(f"CONNECT to {host}:{port} timed out"),
             )
         except (ConnectionRefusedError, ConnectionError, OSError) as e:
             logger.warning("[%s:%d] Connection error: %s", host, port, e)
-            self._safe_deliver_connect_error(host, port, e)
+            self._proxy._deliver_connect_error(host, port, e)
         except Exception as e:
             logger.error(
                 "[%s:%d] Error: %s\n%s",
@@ -342,11 +306,11 @@ class _ProxyHandler:
                 e,
                 traceback.format_exc(),
             )
-            self._safe_deliver_connect_error(host, port, e)
+            self._proxy._deliver_connect_error(host, port, e)
         finally:
             for conn in (target_tls, client_tls, target):
                 if conn:
-                    self._safe_untrack(conn)
+                    self._proxy._untrack_connection(conn)
                     await conn.close()
 
     async def _connect_via_sidecar(
@@ -591,7 +555,7 @@ class SessionProxy:
         port: int = 0,
         config: ProxyConfig = DEFAULT_CONFIG,
         sidecar: Optional[SidecarManager] = None,
-        policy: Optional[RequestPolicy] = None,
+        policy: Optional[Policy] = None,
         ):
 
         self.host = host
@@ -617,6 +581,11 @@ class SessionProxy:
         # blocking is negligible.
         self._interceptor_lock = threading.Lock()
         self._active_connections: set[ManagedConnection] = set()
+        # Every proxy-owned task (per-connection handler tasks created
+        # by start_server, plus anything _spawn'd internally) is
+        # registered here so ``stop()`` can await orderly termination.
+        # Tasks remove themselves via add_done_callback.
+        self._tasks: set[asyncio.Task[None]] = set()
         self._active_h2_states: list[
             tuple[
                 h2.connection.H2Connection,  # client h2 conn
@@ -627,8 +596,8 @@ class SessionProxy:
         ] = []
 
         # The policy controls header transformation and capture lifecycle.
-        # Custom implementations must satisfy both ``RequestPolicy`` and
-        # ``ResponsePolicy`` (see DefaultPolicy for the reference impl).
+        # Custom implementations must satisfy ``Policy`` 
+        # (see DefaultPolicy for the reference impl).
         # DefaultPolicy holds us via weakref.proxy so there is no
         # reference cycle requiring cyclic GC to collect.
         self.policy = policy if policy is not None else DefaultPolicy(self)
@@ -638,8 +607,21 @@ class SessionProxy:
     async def start(self) -> int:
         """Start listening.  Returns the bound port number."""
         self._handler = _ProxyHandler(self, self._tls, self.config)
+
+        def _on_connect(reader: StreamReader, writer: StreamWriter) -> None:
+            # Plain (non-coroutine) callback: we manage the task lifecycle
+            # ourselves via _spawn so stop() can await it.  Returning a
+            # coroutine here instead would have asyncio create an
+            # untracked Task internally — which is exactly the situation
+            # the task set is meant to avoid.
+            assert self._handler is not None
+            self._spawn(
+                self._handler.handle_client(reader, writer),
+                name="proxy-client",
+            )
+
         self._server = await asyncio.start_server(
-            self._handler.handle_client,
+            _on_connect,
             self.host,
             self.port,
             reuse_address=True,
@@ -656,13 +638,44 @@ class SessionProxy:
         return self.port
 
     async def stop(self) -> None:
-        """Stop accepting new connections and close all active ones."""
+        """Stop accepting new connections and close all active ones.
+
+        Returns when all proxy-owned tasks have terminated (or the
+        per-phase timeouts have elapsed).  Callers can rely on this:
+        after ``stop()`` returns, no handler task is observably running,
+        so dropping the last user-held reference collects the proxy and
+        everything it owned via normal refcounting.
+        """
+        # Phase 1: stop accepting new connections.
         if self._server:
             if self._server.is_serving():
                 self._server.close()
                 await self._server.wait_closed()
             self._server = None
+
+        # Phase 2: graceful teardown of in-flight sessions (GOAWAY +
+        # force-close).  This will cause most handler tasks to exit
+        # their await sites with ConnectionError; they'll fall through
+        # their finally blocks and remove themselves from _tasks.
         await self.close_all_handlers()
+
+        # Phase 3: cancel anything still alive and wait for it.  We snapshot
+        # the set because done-callbacks mutate it during iteration.
+        tasks = [t for t in self._tasks if not t.done()]
+        if tasks:
+            for t in tasks:
+                t.cancel()
+            _, pending = await asyncio.wait(tasks, timeout=2.0)
+            if pending:
+                logger.warning(
+                    "SessionProxy.stop: %d task(s) did not terminate: %s",
+                    len(pending),
+                    [t.get_name() for t in pending],
+                )
+
+        # Now safe to drop the handler — no live task references it any
+        # more, so the (SessionProxy → _handler → _proxy) cycle resolves
+        # by refcount alone.
         self._handler = None
         # Reset the policy back to a fresh DefaultPolicy with no rules,
         # so a stopped-then-restarted SessionProxy behaves like new.
@@ -670,6 +683,29 @@ class SessionProxy:
         self.policy = DefaultPolicy(self)
         self.socks_proxy = None
         logger.info("SessionProxy stopped (was :%d)", self.port)
+
+    # -- task management ---------------------------------------------------
+
+    def _spawn(
+        self, coro: Coroutine[object, object, None], *, name: Optional[str] = None
+    ) -> asyncio.Task[None]:
+        """Create and register a proxy-owned task.
+
+        Every task that should be awaited by ``stop()`` must be created
+        through this method (or registered via ``_register_task`` if it
+        was created elsewhere, e.g. by ``asyncio.start_server``).
+        """
+        task = asyncio.create_task(coro, name=name)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+        return task
+
+    def _register_task(self, task: asyncio.Task[None]) -> None:
+        """Register a task created outside _spawn (idempotent, set semantics)."""
+        if task in self._tasks:
+            return
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
 
     # -- SOCKS proxy management --------------------------------------------
 
@@ -777,7 +813,6 @@ class SessionProxy:
 
     def _start_capture(self, url: str) -> Optional[_ResponseCapture]:
         """If any active interceptor wants this URL, return a capture buffer."""
-        logger.info("URL: %s", url)
         with self._interceptor_lock:
             for ic in self._interceptors:
                 if ic.matches(url) is not None:
@@ -857,27 +892,28 @@ class SessionProxy:
         # Send GOAWAY on all tracked HTTP/2 sessions
         h2_states = list(self._active_h2_states)
         self._active_h2_states.clear()
-        for client_h2, target_h2, client_io, target_io in h2_states:
-            try:
-                client_h2.close_connection(error_code=0)
-                data = client_h2.data_to_send()
-                if data and not client_io.closed:
-                    client_io.writer.write(data)
-                    await asyncio.wait_for(
-                        client_io.writer.drain(), timeout=2.0
-                    )
-            except Exception as e:
-                logger.trace("client h2 GOAWAY flush failed: %s", e)
-            try:
-                target_h2.close_connection(error_code=0)
-                data = target_h2.data_to_send()
-                if data and not target_io.closed:
-                    target_io.writer.write(data)
-                    await asyncio.wait_for(
-                        target_io.writer.drain(), timeout=2.0
-                    )
-            except Exception as e:
-                logger.trace("target h2 GOAWAY flush failed: %s", e)
+
+        async def _goaway(
+            client_h2: h2.connection.H2Connection,
+            target_h2: h2.connection.H2Connection,
+            client_io: ManagedConnection,
+            target_io: ManagedConnection,
+        ) -> None:
+            for h2c, io in ((client_h2, client_io), (target_h2, target_io)):
+                try:
+                    h2c.close_connection(error_code=0)
+                    data = h2c.data_to_send()
+                    if data and not io.closed:
+                        io.writer.write(data)
+                        await io.writer.drain()
+                except Exception as e:
+                    logger.debug("h2 GOAWAY flush failed: %s", e)
+
+        if h2_states:
+            await asyncio.wait_for(
+                asyncio.gather(*(_goaway(*s) for s in h2_states), return_exceptions=True),
+                timeout=5.0,
+            )
 
         # Force-close all remaining TCP connections
         connections = list(self._active_connections)

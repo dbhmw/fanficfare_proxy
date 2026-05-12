@@ -202,19 +202,22 @@ class RequestInterceptor:
         "_futures",
         "_queue",
         "_remaining",
-        "_proxy",
+        "_proxy_ref",
         "_caller_loop",
         "_entered",
     )
 
     def __init__(self, patterns: list[str], proxy: SessionProxy) -> None:
         self._patterns = list(patterns)
-        # weakref.proxy: while we're registered the proxy holds a strong
+        # weakref.ref: while we're registered the proxy holds a strong
         # reference to us via ``proxy._interceptors``, so the proxy
         # outlives us during the ``async with`` block.  After unregister,
         # the user may keep the interceptor object around; we don't
         # need (and shouldn't) keep the proxy alive on their behalf.
-        self._proxy = weakref.proxy(proxy)
+        # ``weakref.ref`` (rather than ``weakref.proxy``) makes the
+        # dereference explicit — every callable site checks for None
+        # instead of catching ReferenceError after the fact.
+        self._proxy_ref: weakref.ref[SessionProxy] = weakref.ref(proxy)
         self._entered = False
         self._caller_loop: Optional[asyncio.AbstractEventLoop] = None
 
@@ -322,23 +325,27 @@ class RequestInterceptor:
     # -- context manager ---------------------------------------------------
 
     async def __aenter__(self) -> RequestInterceptor:
+        proxy = self._proxy_ref()
+        if proxy is None:
+            raise RuntimeError(
+                "SessionProxy was destroyed before interceptor entry"
+            )
         self._caller_loop = asyncio.get_running_loop()
         for p in self._patterns:
             self._futures[p] = self._caller_loop.create_future()
-        self._proxy._register_interceptor(self)
+        proxy._register_interceptor(self)
         self._entered = True
         return self
 
     async def __aexit__(self, *exc: object) -> None:
-        # If the SessionProxy was destroyed before us (unusual but possible
-        # if the user dropped their proxy reference before exiting the
-        # ``async with`` block), the weakref raises ReferenceError on
-        # access.  That's fine — the proxy is gone, so unregistering is
-        # a no-op anyway.
-        try:
-            self._proxy._unregister_interceptor(self)
-        except ReferenceError:
-            pass
+        # If the SessionProxy was destroyed before us (unusual but
+        # possible if the user dropped their proxy reference before
+        # exiting the ``async with`` block), the weakref returns None.
+        # That's fine — the proxy is gone, so unregistering is a no-op
+        # anyway.
+        proxy = self._proxy_ref()
+        if proxy is not None:
+            proxy._unregister_interceptor(self)
         for fut in self._futures.values():
             if not fut.done():
                 fut.cancel()

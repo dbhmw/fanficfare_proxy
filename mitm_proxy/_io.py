@@ -21,6 +21,7 @@ import random
 import ssl
 import struct
 import time
+import urllib.parse
 from asyncio import StreamReader, StreamWriter
 from typing import Optional
 
@@ -103,7 +104,8 @@ class ManagedConnection:
 
 
 class Socks5Client:
-    """Async SOCKS5 CONNECT client (no-auth method only)."""
+    """Async SOCKS5 CONNECT client. Implements RFC 1928 with optional
+    RFC 1929 username/password authentication."""
 
     @staticmethod
     async def connect(
@@ -114,43 +116,138 @@ class Socks5Client:
         Parameters
         ----------
         proxy:
-            ``host:port`` of the SOCKS5 proxy.  ``user@host:port`` is
-            accepted but the user part is stripped (no auth sent).
+            ``host:port`` or ``user:pass@host:port``.  Credentials may
+            be percent-encoded (``%3A`` for ``:``, ``%40`` for ``@``)
+            if they contain delimiter characters.
         target_host:
-            The hostname the SOCKS5 proxy should connect to.
+            Hostname the SOCKS5 proxy should connect to.
         target_port:
-            The port the SOCKS5 proxy should connect to.
+            Port the SOCKS5 proxy should connect to.
         timeout:
-            Overall timeout for the SOCKS5 handshake + CONNECT.
+            Overall timeout for the handshake + CONNECT.
+
+        Raises
+        ------
+        ConnectionError
+            If the proxy is malformed, the server's responses violate
+            RFC 1928 / RFC 1929, or the CONNECT is rejected.
         """
-        proxy_host, proxy_port = proxy, 1080
-        if ":" in proxy:
-            proxy_host, port_str = proxy.rsplit(":", 1)
+        # ── Parse the proxy URL ───────────────────────────────────────
+        username: Optional[str] = None
+        password: Optional[str] = None
+        if "@" in proxy:
+            creds, _, host_port = proxy.rpartition("@")
+            if ":" in creds:
+                raw_user, _, raw_pass = creds.partition(":")
+                username = urllib.parse.unquote(raw_user)
+                password = urllib.parse.unquote(raw_pass)
+            else:
+                # Username-only form (rare but valid in some deployments).
+                username = urllib.parse.unquote(creds)
+                password = ""
+            proxy_host = host_port
+        else:
+            proxy_host = proxy
+
+        proxy_port = 1080
+        if ":" in proxy_host:
+            proxy_host, port_str = proxy_host.rsplit(":", 1)
             try:
                 proxy_port = int(port_str)
             except ValueError:
                 raise ConnectionError(
                     f"Malformed SOCKS5 proxy {proxy!r}: bad port"
                 )
-        if "@" in proxy_host:
-            proxy_host = proxy_host.split("@")[-1]
 
+        # RFC 1929 §2: ULEN and PLEN are single bytes (max 255).
+        u_bytes = username.encode("utf-8") if username is not None else b""
+        p_bytes = (password or "").encode("utf-8")
+        if username is not None:
+            if not u_bytes or len(u_bytes) > 255 or len(p_bytes) > 255:
+                raise ConnectionError(
+                    "SOCKS5 username/password must be 1-255 bytes each"
+                )
+
+        # RFC 1928 §4: DST.ADDR for domain-name ATYP is length-prefixed
+        # by a single byte, so the hostname has the same 255-byte cap.
+        domain = target_host.encode("utf-8")
+        if not domain or len(domain) > 255:
+            raise ConnectionError(
+                f"SOCKS5 target hostname must be 1-255 bytes "
+                f"(got {len(domain)}: {target_host!r})"
+            )
+
+        # ── Open TCP to the proxy ─────────────────────────────────────
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(proxy_host, proxy_port), timeout=timeout
         )
+        success: bool = False
 
         try:
             async with asyncio.timeout(timeout):
-                # Greeting: version 5, 1 method (no-auth)
-                writer.write(b"\x05\x01\x00")
+                # ── RFC 1928 §3: method selection ─────────────────────
+                # Greeting advertises VER=5, NMETHODS, then the method list.
+                # We always offer no-auth (0x00); add user/pass (0x02)
+                # if credentials were supplied.
+                if username is not None:
+                    writer.write(b"\x05\x02\x00\x02")
+                else:
+                    writer.write(b"\x05\x01\x00")
                 await writer.drain()
 
                 resp = await reader.readexactly(2)
-                if resp[0] != 0x05 or resp[1] == 0xFF:
-                    raise ConnectionError("SOCKS5 handshake failed")
+                if resp[0] != 0x05:
+                    raise ConnectionError(
+                        f"SOCKS5: bad version 0x{resp[0]:02x} in method "
+                        f"selection reply (RFC 1928 §3 requires 0x05)"
+                    )
+                method = resp[1]
+                if method == 0xFF:
+                    raise ConnectionError(
+                        "SOCKS5: server rejected all offered auth methods"
+                    )
 
-                # CONNECT request: domain-name address type (0x03)
-                domain = target_host.encode("utf-8")
+                if method == 0x00:
+                    if username is not None:
+                        logger.debug(
+                            "SOCKS5: server selected no-auth despite "
+                            "credentials being offered"
+                        )
+                elif method == 0x02:
+                    if username is None:
+                        raise ConnectionError(
+                            "SOCKS5: server selected user/pass auth "
+                            "but no credentials were supplied"
+                        )
+                    # ── RFC 1929 §2: user/pass sub-negotiation ────────
+                    auth_pkt = (
+                        b"\x01"
+                        + bytes([len(u_bytes)]) + u_bytes
+                        + bytes([len(p_bytes)]) + p_bytes
+                    )
+                    writer.write(auth_pkt)
+                    await writer.drain()
+
+                    auth_resp = await reader.readexactly(2)
+                    if auth_resp[0] != 0x01:
+                        raise ConnectionError(
+                            f"SOCKS5 auth: bad sub-negotiation version "
+                            f"0x{auth_resp[0]:02x} (RFC 1929 §2 requires 0x01)"
+                        )
+                    if auth_resp[1] != 0x00:
+                        raise ConnectionError(
+                            f"SOCKS5 auth: server rejected credentials "
+                            f"(status 0x{auth_resp[1]:02x})"
+                        )
+                else:
+                    raise ConnectionError(
+                        f"SOCKS5: server selected unsupported method "
+                        f"0x{method:02x}"
+                    )
+
+                # ── RFC 1928 §4: CONNECT request ──────────────────────
+                # VER=5, CMD=CONNECT(1), RSV=0, ATYP=domain(3),
+                # DST.ADDR (length-prefixed), DST.PORT (big-endian u16).
                 request = (
                     b"\x05\x01\x00\x03"
                     + bytes([len(domain)])
@@ -160,49 +257,61 @@ class Socks5Client:
                 writer.write(request)
                 await writer.drain()
 
-                # CONNECT response
+                # ── RFC 1928 §6: CONNECT reply ────────────────────────
                 resp = await reader.readexactly(4)
+                if resp[0] != 0x05:
+                    raise ConnectionError(
+                        f"SOCKS5: bad version 0x{resp[0]:02x} in CONNECT "
+                        f"reply (RFC 1928 §6 requires 0x05)"
+                    )
+                if resp[2] != 0x00:
+                    raise ConnectionError(
+                        f"SOCKS5: non-zero RSV byte 0x{resp[2]:02x} in "
+                        f"CONNECT reply (RFC 1928 §6 requires 0x00)"
+                    )
                 if resp[1] != 0x00:
                     errors = {
-                        1: "General failure",
-                        2: "Not allowed",
+                        1: "General SOCKS server failure",
+                        2: "Connection not allowed by ruleset",
                         3: "Network unreachable",
                         4: "Host unreachable",
                         5: "Connection refused",
                         6: "TTL expired",
+                        7: "Command not supported",
+                        8: "Address type not supported",
                     }
                     raise ConnectionError(
-                        f"SOCKS5: {errors.get(resp[1], 'Unknown error')}"
+                        f"SOCKS5: {errors.get(resp[1], f'Unknown error 0x{resp[1]:02x}')}"
                     )
 
-                # Drain the bound address so the socket is ready for data
+                # Drain BND.ADDR + BND.PORT so the socket starts clean.
                 atyp = resp[3]
-                if atyp == 0x01:  # IPv4 + port
+                if atyp == 0x01:    # IPv4 (4) + port (2)
                     await reader.readexactly(6)
-                elif atyp == 0x03:  # Domain + port
+                elif atyp == 0x03:  # Domain: len (1) + name + port (2)
                     length = (await reader.readexactly(1))[0]
                     await reader.readexactly(length + 2)
-                elif atyp == 0x04:  # IPv6 + port
+                elif atyp == 0x04:  # IPv6 (16) + port (2)
                     await reader.readexactly(18)
                 else:
-                    # Unknown ATYP — proxy is misbehaving.  We can't safely
-                    # drain its bound-address response without knowing how
-                    # many bytes follow, so we abort rather than leave
-                    # stale bytes in the read buffer.
+                    # Unknown ATYP — we can't safely drain without
+                    # knowing how many bytes follow, so abort rather
+                    # than leave stale bytes in the read buffer.
                     raise ConnectionError(
                         f"SOCKS5: unknown ATYP 0x{atyp:02x} in CONNECT reply"
                     )
 
+            success = True
             return reader, writer
-        except Exception:
-            writer.close()
-            try:
-                # wait_closed() can hang indefinitely if the peer is
-                # wedged — bound it.
-                await asyncio.wait_for(writer.wait_closed(), timeout=2.0)
-            except (asyncio.TimeoutError, Exception):
-                pass
-            raise
+        finally:
+            if not success:
+                writer.close()
+                try:
+                    # wait_closed() can hang indefinitely if the peer is
+                    # wedged — bound it.
+                    await asyncio.wait_for(writer.wait_closed(), timeout=2.0)
+                except Exception:
+                    pass
 
 
 class SocksProxyPool:

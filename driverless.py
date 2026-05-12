@@ -4,7 +4,7 @@ uvloop.install()
 import patch_func
 from patch_func import _clear_frames
 
-from typing import Optional, Literal, Any, TypedDict, TextIO, cast, Callable, AsyncGenerator, NotRequired, Coroutine
+from typing import Optional, Literal, Any, TypedDict, TextIO, cast, Callable, AsyncGenerator, NotRequired
 import asyncio, zlib, argparse, configparser, sys, signal, logging
 import ssl, base64, hashlib, json, re, threading
 import weakref
@@ -380,6 +380,11 @@ class Init:
         logger.debug(f"Awaiting tasks {tasks_to_await}")
         results = await asyncio.gather(*tasks_to_await, return_exceptions=True)
         logger.debug(results)
+
+        try:
+            await asyncio.to_thread(ProxyLoop.get().stop)
+        except Exception as e:
+            logger.warning("Failed to stop shared proxy loop: %s", e)
 
         logger.debug("Cancelling remaining tasks.")
         tasks_to_cancel: list[asyncio.Task[None]] = [
@@ -1051,11 +1056,6 @@ class BrowserController:
             await self.fp_proxy.stop()
         await self.destroy_main_driver()
 
-        try:
-            await asyncio.to_thread(ProxyLoop.get().stop)
-        except Exception as e:
-            logger.warning("Failed to stop shared proxy loop: %s", e)
-
     async def _shutdown_session(self, session: str) -> None:
         logger.debug("Force %s", session)
         try:
@@ -1275,22 +1275,12 @@ class DrivenBrowser:
 
         logger.info("Stopping SOCKS5 proxy...")
 
-        # Close active connections
-        future = asyncio.run_coroutine_threadsafe(
-            self.socks_proxy_instance.close_all_handlers(), loop
-        )
-        try:
-            logger.debug("Awaiting close_all_handlers")
-            await asyncio.wait_for(asyncio.wrap_future(future), timeout=10.0)
-        except Exception:
-            logger.warning("close_all_handlers error: %s", traceback.format_exc())
-
         # Stop the server
         future = asyncio.run_coroutine_threadsafe(
             self.socks_proxy_instance.stop(), loop
         )
         try:
-            await asyncio.wait_for(asyncio.wrap_future(future), timeout=5.0)
+            await asyncio.wait_for(asyncio.wrap_future(future), timeout=10.0)
         except asyncio.TimeoutError as e:
             logger.warning("SOCKS5 stop() timed out; cancelling")
             future.cancel()
@@ -1702,7 +1692,7 @@ class ClientRequest:
 
     async def driverless_get(self, tab: Target, url: str, image: Literal["True", "False"], headers: dict[str, str]) -> tuple[int, str, bytes, str]:
         response_headers: list[tuple[str, str]] = []
-        referer: str = headers.get('Referer', '')
+        referer: Optional[str] = headers.get('Referer')
         old = url
         content_type = "None"
         status_code = -10
@@ -1771,9 +1761,11 @@ class ClientRequest:
                         logger.debug("Stop error %s", str(e))
 
             except CDPError as e:
+                logger.warning(e)
                 if not (e.code == -32602 and e.message == 'Invalid InterceptionId.'):
                     raise e
             except Exception as e:
+                logger.warning(e)
                 raise e from None
             finally:
                 try:
@@ -1881,7 +1873,8 @@ class ClientRequest:
                     request['headers']['Referer'] = request['url']
                     continue
 
-                await self.is_captcha(tab, result[0])
+                if not await self.is_captcha(tab, result[0]) and attempt > 0:
+                    break
                 continue
             break
         else:

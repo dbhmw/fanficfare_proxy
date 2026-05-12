@@ -13,7 +13,7 @@ For interception::
 
 For custom policies::
 
-    from proxy import DefaultPolicy, RequestPolicy, ResponsePolicy
+    from proxy import DefaultPolicy, Policy
 
 The internal modules (``_common``, ``_io``, ``_interceptor``,
 ``_policy``, ``_http1``, ``_http2``) are not part of the stable
@@ -44,8 +44,7 @@ from ._interceptor import (
 from ._policy import (
     DefaultPolicy,
     HeaderModifier,
-    RequestPolicy,
-    ResponsePolicy,
+    Policy,
 )
 from .session import SessionProxy
 from .utls_bridge.sidecar import (
@@ -68,8 +67,7 @@ __all__ = [
     "RequestInterceptor",
     "InterceptedResponse",
     "DefaultPolicy",
-    "RequestPolicy",
-    "ResponsePolicy",
+    "Policy",
     "HeaderModifier",
     "SocksProxyPool",
     "SidecarManager",

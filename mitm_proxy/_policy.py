@@ -7,11 +7,11 @@ Two layers in this module:
   classmethods, no internal state, easy to call from custom policies
   via ``HeaderModifier.scrub_request_headers(...)`` etc.
 
-* ``RequestPolicy`` and ``ResponsePolicy`` — :class:`typing.Protocol`
-  interfaces describing what the protocol handlers expect.  Both are
-  used at four points per request/response: outgoing-header transform
-  (h1 + h2 paths), incoming-header transform (h1 line-by-line and h2
-  full-list), capture lifecycle (``open_capture`` / ``deliver_capture``).
+* ``Policy`` — :class:`typing.Protocol` describing what the protocol
+  handlers need from a policy.  Covers request-header transformation,
+  response-header filtering (h1 line-by-line + h2 full-list), and the
+  capture lifecycle used by the interception API.  See its docstring
+  for the four hook points.
 
 * ``DefaultPolicy`` — the reference implementation: hygiene + URL-rule
   merging + interceptor-driven capture.  Subclass and call
@@ -20,9 +20,12 @@ Two layers in this module:
 
 Reference model
 ~~~~~~~~~~~~~~~
-``SessionProxy`` strongly references its policy.  The default policy
-holds the proxy via ``weakref.proxy`` so there's no cycle requiring
-cyclic GC to collect.  Custom policies should follow the same pattern.
+``SessionProxy`` strongly references its policy.  ``DefaultPolicy``
+holds the proxy via ``weakref.proxy`` so a user-supplied custom policy
+doesn't accidentally keep the SessionProxy (and all its connections)
+alive past ``stop()``.  Calling a policy method after the proxy is
+destroyed raises ``ReferenceError``, by design — policy operations
+have no meaning without the owning session.
 """
 
 from __future__ import annotations
@@ -299,12 +302,41 @@ class HeaderModifier:
         return updated
 
 
-class RequestPolicy(TypingProtocol):
-    """Transforms outgoing requests before they leave the proxy.
+class Policy(TypingProtocol):
+    """The policy contract the proxy requires.
 
     Implementations must be **pure** — no I/O, no async — because the
     handlers call them synchronously while holding the event loop.
+    Each request/response touches the policy at four points:
+
+    1. **Outgoing request headers** (h1 + h2):
+       :meth:`transform_request_headers` rewrites the full header list
+       before it's sent to the target.
+    2. **Incoming response headers, line-by-line** (h1 only):
+       :meth:`filter_response_header_line` filters each header as it's
+       forwarded to the browser.  Returning ``None`` drops the line.
+    3. **Incoming response headers, full list** (h2 only):
+       :meth:`filter_response_headers` filters all headers at once
+       (h2 always has them buffered together as HEADERS/CONTINUATION).
+    4. **Capture lifecycle** (h1 + h2): :meth:`open_capture` decides
+       whether a URL is being intercepted; :meth:`deliver_capture`
+       hands the completed body to the interceptor when the response
+       finishes.
+
+    The h1/h2 split for response headers is a protocol artefact, not
+    a design choice: h1 forwards bytes as they arrive (no buffering),
+    h2 has the full HEADERS frame in hand before forwarding.  Custom
+    policies typically implement one in terms of the other — see
+    ``DefaultPolicy`` for the reference pattern (line-based delegates
+    to a per-header version of the list-based logic).
+
+    ``SessionProxy(policy=...)`` is typed against this protocol.
+    ``DefaultPolicy`` satisfies it structurally; custom policies
+    should either subclass ``DefaultPolicy`` (to inherit hygiene and
+    URL-rule merging) or implement every method below from scratch.
     """
+
+    # -- request side ------------------------------------------------------
 
     def transform_request_headers(
         self,
@@ -320,17 +352,7 @@ class RequestPolicy(TypingProtocol):
         """
         ...
 
-
-class ResponsePolicy(TypingProtocol):
-    """Transforms incoming responses before they reach the browser, plus
-    decides whether each request URL should be captured for interception.
-
-    The two paths (h1, h2) consume different parts of this interface:
-    h1 forwards headers one line at a time and calls
-    ``filter_response_header_line``; h2 has the full header list and
-    calls ``filter_response_headers``.  Both delegate to the same
-    underlying logic in ``DefaultPolicy``.
-    """
+    # -- response side -----------------------------------------------------
 
     def filter_response_headers(
         self,
@@ -347,17 +369,33 @@ class ResponsePolicy(TypingProtocol):
         """
         ...
 
+    # -- capture lifecycle -------------------------------------------------
+
     def open_capture(self, url: str) -> Optional[_ResponseCapture]:
-        """Open a response capture if *url* matches a live interceptor."""
+        """Open a response capture if *url* matches a live interceptor.
+
+        Called once per request, before any response bytes arrive.
+        Return a fresh ``_ResponseCapture`` to start buffering, or
+        ``None`` if no interceptor wants this URL.
+        """
         ...
 
     def deliver_capture(self, capture: _ResponseCapture) -> None:
-        """Finalise and dispatch a completed capture to interceptors."""
+        """Finalise and dispatch a completed capture to interceptors.
+
+        Called once the response body has been fully received.  The
+        capture's status, headers, and body buffer are populated by
+        the handler before this is invoked.
+        """
         ...
 
 
 class DefaultPolicy:
     """The proxy's default policy: hygiene + URL→header rules + capture lifecycle.
+
+    Satisfies the :class:`Policy` protocol.  When ``SessionProxy`` is
+    constructed without an explicit ``policy=`` argument, an instance
+    of this class is used as the default.
 
     Three layers of behaviour, applied in order:
 
@@ -396,10 +434,11 @@ class DefaultPolicy:
 
     Reference model
     ~~~~~~~~~~~~~~~
-    The proxy owns the policy (strong: ``proxy.policy``); the policy
-    holds the proxy via ``weakref.proxy`` so there is no cycle that
-    depends on cyclic GC.  Calling a policy method after the proxy is
-    destroyed raises ``ReferenceError`` — the correct behaviour, because
+    The proxy owns the policy strongly (``proxy.policy``).  This class
+    holds the proxy via ``weakref.proxy`` so a user holding a reference
+    to a custom subclass doesn't accidentally keep the SessionProxy (and
+    all its connections) alive past ``stop()``.  Calling a policy method
+    after the proxy is destroyed raises ``ReferenceError``, by design —
     policy operations are meaningless without the owning session.
     """
 
@@ -456,7 +495,7 @@ class DefaultPolicy:
                 return True
         return False
 
-    # -- RequestPolicy -----------------------------------------------------
+    # -- Policy: request side ----------------------------------------------
 
     def transform_request_headers(
         self,
@@ -476,7 +515,7 @@ class DefaultPolicy:
             )
         return pseudo + regular
 
-    # -- ResponsePolicy ----------------------------------------------------
+    # -- Policy: response side ---------------------------------------------
 
     def filter_response_headers(
         self,
