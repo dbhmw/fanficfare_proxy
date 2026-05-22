@@ -523,7 +523,7 @@ class ProxyServer:
             self.init.terminated()
             return
 
-        logger.info("Serving FFF proxy on %s", self.server.sockets[0].getsockname())
+        logger.info("Serving FFF proxy on %s, %d", self.server.sockets[0].getsockname(), os.getpid())
 
         asyncio.set_event_loop(loop)
         self.server_task = asyncio.create_task(self.server.serve_forever(), name="ServerTask")
@@ -538,17 +538,18 @@ class ProxyServer:
         packet: bytes = await self.receive_request(reader)
         request: ServerRequest = await self.decrypt(packet)
 
-        try:
-            if request["session"] == "None":
-                _drivenbrowser, drivenbrowser_ref = await self.browsercontroller.get_temp_browser(request["session"])
-            else:
-                logger.debug("Client %s: Request for browser enqueued.", request["session"])
-                drivenbrowser_ref = await self.browsercontroller.get_session_browser(request["session"])
-        except Exception as e:
-            logger.error(traceback.format_exc())
-            logger.error("Failed to get browser")
-            await self.send_response(writer, await self.encrypt(response=content))
-            raise e
+        async with asyncio.timeout(60):
+            try:
+                if request["session"] == "None":
+                    _drivenbrowser, drivenbrowser_ref = await self.browsercontroller.get_temp_browser(request["session"])
+                else:
+                    logger.debug("Client %s: Request for browser enqueued.", request["session"])
+                    drivenbrowser_ref = await self.browsercontroller.get_session_browser(request["session"])
+            except Exception as e:
+                logger.error(traceback.format_exc())
+                logger.error("Failed to get browser")
+                await self.send_response(writer, await self.encrypt(response=content))
+                raise e
 
         try:
             heartbeat = asyncio.create_task(self.heartbeat(writer, request["heartbeat"]))
@@ -907,6 +908,8 @@ class BrowserController:
         _options.add_argument("--disable-features=DisableLoadExtensionCommandLineSwitch")
         _options.add_argument("--disable-features=UserAgentClientHint")
         _options.update_pref("download.prompt_for_download", False)
+        # _options.add_argument("--net-log-capture-mode=Everything")
+        # _options.add_argument("--log-net-log=/tmp/chrome.json")
         # _options.add_argument("--enable-logging")
         # _options.add_argument("--v=1")
         # _options.add_argument("--auto-open-devtools-for-tabs")
@@ -1213,9 +1216,10 @@ class DrivenBrowser:
         logger.info("Removed intercept rule for session %s", self.session)
 
     async def destroy_tab(self, requestid: int) -> None:
+        tab = self.sessiontabs.pop(requestid, None)
+        logger.debug(await self.context.window_handles)
         try:
-            if requestid in self.sessiontabs:
-                tab = self.sessiontabs.pop(requestid)
+            if tab:
                 target_id = tab.id
 
                 try:
@@ -1235,6 +1239,7 @@ class DrivenBrowser:
                 logger.debug("Requestid not found. Chrome was destroyed?")
         except Exception as e:
             logger.warning("Unable to close the tab", exc_info=e)
+        logger.debug(await self.context.window_handles)
 
     async def initialize_socks5(self) -> None:
         self.socks_proxy_instance = SessionProxy(
@@ -1825,7 +1830,7 @@ class ClientRequest:
             logger.debug("We got extra cookies")
             await asyncio.gather(*(tab.add_cookie(cookie) for cookie in request["cookies"]))
 
-        for attempt in range(0, 5):
+        for attempt in range(0, 3):
             logger.info("Attempt %s for %s [%s]", str(attempt), request['session'], request["url"])
             try:
                 if request["method"] == "GET":

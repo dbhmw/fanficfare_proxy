@@ -86,7 +86,7 @@ class ProxyConfig:
     verify_ssl: bool = True
 
     connect_timeout: float = 120.0
-    idle_timeout: float = 55.0
+    idle_timeout: float = 120.0
     request_timeout: float = 120.0
     stream_timeout: float = 120.0
 

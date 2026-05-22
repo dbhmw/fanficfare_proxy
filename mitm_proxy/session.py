@@ -871,7 +871,7 @@ class SessionProxy:
                         url=pat,
                         status_code=502,
                         headers=[("content-type", "text/plain")],
-                        body=error_body,
+                        raw_body=error_body,
                         content_type="text/plain",
                         content_encoding="",
                     )

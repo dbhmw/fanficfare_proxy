@@ -25,10 +25,11 @@ from __future__ import annotations
 import asyncio
 import time
 import traceback
-from typing import TYPE_CHECKING, Callable, Optional
+from typing import TYPE_CHECKING, Optional
 
 import h2.config
 import h2.connection
+import h2.errors
 import h2.events
 import h2.exceptions
 import h2.settings
@@ -68,6 +69,77 @@ def _relax_h2_goaway_state() -> None:
 _relax_h2_goaway_state()
 
 
+# ── Tuning constants ────────────────────────────────────────────────────────
+
+# Chrome bumps the HTTP/2 connection-level receive window to 15 MiB right
+# after the preface (the spec default is 65535).  We advertise the same
+# increment on the browser-facing connection so our flow-control posture
+# matches Chrome's and large downloads aren't throttled by a tiny window.
+# 15 MiB total − 65535 default = 15663105.
+_BROWSER_FACING_RECV_WINDOW_INCREMENT = 15 * 1024 * 1024 - 65535  # 15663105
+
+# h2 reports a sentinel of 2**32+1 for MAX_CONCURRENT_STREAMS when the peer
+# never advertised one.  Treat any value below this threshold as a genuine
+# per-peer limit (and mirror it as-is); at or above it, assume "unset" and
+# fall back to Chrome's customary advertised value.  2**31 sits safely above
+# any realistic real limit and well below the sentinel.
+_H2_UNSET_CONCURRENT_STREAMS_THRESHOLD = 1 << 31
+# Chrome advertises MAX_CONCURRENT_STREAMS=100; use the same when the target
+# didn't specify a limit of its own.
+_DEFAULT_MAX_CONCURRENT_STREAMS = 100
+
+
+def _decode_header(value: object) -> str:
+    """Normalise an h2 header name/value to ``str``.
+
+    h2 yields header names and values as ``bytes`` on the wire, but a
+    custom policy's ``filter_response_headers`` may hand back either
+    ``bytes`` or ``str``.  Routing both the request-header build and the
+    response-capture bookkeeping through this helper keeps a single
+    convention — capture state is always ``str`` — instead of one call
+    site trusting bytes and another defending against str.
+    """
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value  # type: ignore[return-value]
+
+
+class _Direction:
+    """Per-direction flow-control + backpressure state for one stream.
+
+    A proxied stream carries DATA both ways, and each way needs its own
+    bookkeeping.  ``Http2Stream`` holds two of these: ``to_target``
+    (browser → origin) and ``to_client`` (origin → browser).  Bundling
+    the three fields here lets the backpressure helpers take a single
+    ``_Direction`` argument instead of a buffer plus four getter/setter
+    callables threaded through as per-event lambdas.
+
+    Fields
+    ------
+    pending:
+        Bytes received from the sender that the receiver's flow-control
+        window couldn't accommodate yet.  Drained by
+        ``_drain_pending_with_backpressure`` when a WINDOW_UPDATE for
+        this stream arrives.
+    pending_end:
+        Whether END_STREAM was set on the queued tail.  The flag rides
+        out on the final drained frame rather than being sent early.
+    deferred_ack:
+        Bytes received from the sender but not yet ACKed (via
+        WINDOW_UPDATE) because we haven't forwarded them onward.
+        Deferring the ACK is what produces end-to-end backpressure — the
+        sender doesn't refill until we've actually moved its bytes
+        through.
+    """
+
+    __slots__ = ("pending", "pending_end", "deferred_ack")
+
+    def __init__(self) -> None:
+        self.pending: bytearray = bytearray()
+        self.pending_end: bool = False
+        self.deferred_ack: int = 0
+
+
 class Http2Stream:
     """Maps a single HTTP/2 stream between the client and target sides.
 
@@ -84,23 +156,27 @@ class Http2Stream:
         "path",
         "scheme",
         "created_at",
+        "last_activity",
         "url",
-        # Per-direction pending buffers + deferred-ACK counters.
-        # When we receive DATA on one side but the OTHER side's outgoing
-        # window won't accommodate it, we buffer here and defer the
-        # WINDOW_UPDATE ACK to the sender.  The sender then naturally
-        # backpressures because we're not telling them they have more
-        # window until we've actually moved their bytes through.
+        # Per-direction flow-control + backpressure state.  When we
+        # receive DATA on one side but the OTHER side's outgoing window
+        # won't accommodate it, we buffer in the relevant _Direction and
+        # defer the WINDOW_UPDATE ACK to the sender.  The sender then
+        # naturally backpressures because we're not telling them they
+        # have more window until we've actually moved their bytes
+        # through.
         #
-        # See ``Http2Handler._forward_data_with_backpressure`` for the
-        # full protocol — this is where the actual flow control gets
-        # plumbed end-to-end across the two h2 connections.
-        "pending_to_target",        # bytes from browser, awaiting target window
-        "pending_to_target_end",    # was END_STREAM set on the queued tail?
-        "deferred_ack_to_client",   # bytes we owe the browser as WINDOW_UPDATE
-        "pending_to_client",        # bytes from target, awaiting browser window
-        "pending_to_client_end",    # was END_STREAM set on the queued tail?
-        "deferred_ack_to_target",   # bytes we owe the target as WINDOW_UPDATE
+        # ``to_target`` carries browser → origin data; ``to_client``
+        # carries origin → browser data.  See
+        # ``Http2Handler._forward_data_with_backpressure`` for the full
+        # protocol — this is where the actual flow control gets plumbed
+        # end-to-end across the two h2 connections.
+        "to_target",
+        "to_client",
+        # Active idle-timeout TimerHandle (loop.call_later) for this
+        # stream, owned by _StreamReaper.  None when no timer is armed
+        # (before arm(), after a reap, or after disarm()).
+        "_reap_handle",
     )
 
     def __init__(
@@ -118,13 +194,19 @@ class Http2Stream:
         self.path = path
         self.scheme = scheme
         self.created_at = created_at
+        # Wall-clock of the last frame on this stream in either direction.
+        # Used by ``_StreamReaper`` so long-lived streams
+        # (server-sent events, large downloads on slow links, gRPC server
+        # streaming) aren't reaped just because they've been alive longer
+        # than ``stream_timeout`` — what matters is whether they're still
+        # making progress.  Bumped by ``_touch_stream`` on any DataReceived
+        # / WindowUpdated / HeadersReceived event for the stream.
+        self.last_activity = created_at
         self.url = f"{scheme}://{authority}{path}"
-        self.pending_to_target: bytearray = bytearray()
-        self.pending_to_target_end: bool = False
-        self.deferred_ack_to_client: int = 0
-        self.pending_to_client: bytearray = bytearray()
-        self.pending_to_client_end: bool = False
-        self.deferred_ack_to_target: int = 0
+        # browser → origin and origin → browser flow-control state.
+        self.to_target = _Direction()
+        self.to_client = _Direction()
+        self._reap_handle: Optional[asyncio.TimerHandle] = None
 
 
 # ============================================================================
@@ -191,6 +273,181 @@ class _StreamMap:
 
 
 # ============================================================================
+# HTTP/2 idle-stream reaper — event-driven (timer per stream)
+# ============================================================================
+
+
+class _StreamReaper:
+    """Event-driven idle-stream reaper for a single HTTP/2 session.
+
+    Replaces the former fixed-interval polling loop
+    (``_check_stream_timeouts``, which woke every ``min(30, timeout/2)``
+    seconds and scanned every stream).  Each stream gets a timer scheduled
+    for ``last_activity + stream_timeout``.  When it fires we re-check the
+    deadline: if activity has pushed it out since the timer was armed we
+    lazily re-arm to the new deadline, otherwise we reap (RST both sides +
+    deliver any partial capture).  Net effect:
+
+    * A stream is reaped within ``stream_timeout`` of its final frame —
+      the old up-to-30 s tick overshoot is gone.
+    * No periodic O(streams) scan; work happens only when a deadline
+      actually elapses.
+    * :meth:`touch` is O(1) and deliberately does **not** reschedule the
+      timer.  Re-arming a ``TimerHandle`` on every DATA frame would
+      dominate a hot stream's per-frame cost; instead we eat at most one
+      extra re-arm per idle gap when the timer fires early.
+
+    Clock
+    ~~~~~
+    Timers are scheduled via ``loop.call_later`` (``call_at`` in the loop
+    clock under the hood) using delays derived from ``time.monotonic()`` —
+    the same clock ``last_activity``/``created_at`` are stamped with — so
+    we never have to assume ``loop.time()`` and ``time.monotonic()`` share
+    an epoch (they happen to on CPython/uvloop, but that is not contract).
+
+    Flush
+    ~~~~~
+    A ``call_later`` callback is synchronous and cannot ``await`` the
+    socket drain, so a reap only buffers RST frames into the h2 state
+    machines and then sets an ``asyncio.Event``.  The :meth:`run` task
+    (one per session, mostly parked on ``event.wait()``) performs the
+    actual ``_flush_both``.  This keeps the reaper purely event-driven:
+    no task wakes unless a stream genuinely expires.
+    """
+
+    __slots__ = (
+        "_loop", "_timeout", "_handler",
+        "_client_h2", "_target_h2", "_client_io", "_target_io",
+        "_streams", "_captures", "_flush_evt", "_closed",
+    )
+
+    def __init__(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        timeout: float,
+        handler: "Http2Handler",
+        client_h2: h2.connection.H2Connection,
+        target_h2: h2.connection.H2Connection,
+        client_io: ManagedConnection,
+        target_io: ManagedConnection,
+        streams: _StreamMap,
+        captures: dict[int, _ResponseCapture],
+    ) -> None:
+        self._loop = loop
+        self._timeout = timeout
+        self._handler = handler
+        self._client_h2 = client_h2
+        self._target_h2 = target_h2
+        self._client_io = client_io
+        self._target_io = target_io
+        self._streams = streams
+        self._captures = captures
+        self._flush_evt = asyncio.Event()
+        self._closed = False
+
+    # -- timer management --------------------------------------------------
+
+    def arm(self, stream: "Http2Stream") -> None:
+        """Schedule the first reap timer for *stream*.  Called at creation."""
+        if self._closed:
+            return
+        delay = max(
+            0.0, stream.last_activity + self._timeout - time.monotonic()
+        )
+        stream._reap_handle = self._loop.call_later(
+            delay, self._fire, stream.client_stream_id
+        )
+
+    @staticmethod
+    def touch(stream: "Http2Stream") -> None:
+        """Record activity. O(1); does NOT reschedule (see class docstring)."""
+        stream.last_activity = time.monotonic()
+
+    @staticmethod
+    def disarm(stream: "Http2Stream") -> None:
+        """Cancel a stream's reap timer (idempotent). Called from _finish_stream."""
+        if stream._reap_handle is not None:
+            stream._reap_handle.cancel()
+            stream._reap_handle = None
+
+    def close(self) -> None:
+        """Cancel all outstanding timers and release the flush task."""
+        self._closed = True
+        for s in self._streams.values():
+            self.disarm(s)
+        self._flush_evt.set()
+
+    # -- firing ------------------------------------------------------------
+
+    def _fire(self, client_stream_id: int) -> None:
+        stream = self._streams.get_by_client(client_stream_id)
+        if stream is None:
+            return
+        stream._reap_handle = None
+
+        remaining = stream.last_activity + self._timeout - time.monotonic()
+        if remaining > 1e-3:
+            # Activity arrived after the timer was armed (lazy touch never
+            # rescheduled).  Re-arm to the fresh deadline instead of reaping.
+            stream._reap_handle = self._loop.call_later(
+                remaining, self._fire, client_stream_id
+            )
+            return
+
+        now = time.monotonic()
+        logger.info(
+            "[HTTP/2] stream-timeout: RST stream c=%d t=%d url=%s "
+            "idle=%.1fs lifetime=%.1fs",
+            stream.client_stream_id, stream.target_stream_id, stream.url,
+            now - stream.last_activity, now - stream.created_at,
+        )
+        try:
+            self._client_h2.reset_stream(
+                stream.client_stream_id,
+                error_code=h2.errors.ErrorCodes.CANCEL,
+            )
+            self._target_h2.reset_stream(
+                stream.target_stream_id,
+                error_code=h2.errors.ErrorCodes.CANCEL,
+            )
+        except Exception as e:
+            logger.trace(
+                "stream-timeout reset failed (client=%d, target=%d): %s",
+                stream.client_stream_id, stream.target_stream_id, e,
+            )
+        # Synchronous: delivers any partial capture and drops the stream
+        # (its handle is already cleared, so the disarm inside is a no-op).
+        self._handler._finish_stream(
+            stream.client_stream_id, self._streams, self._captures,
+            deliver_partial=True,
+        )
+        self._flush_evt.set()
+
+    # -- flush task --------------------------------------------------------
+
+    async def run(self) -> None:
+        """Drain RST frames produced by reaps. Cancelled at session teardown.
+
+        Mirrors the lifecycle of the old ``timeout_task``: spawned in
+        ``handle`` and cancelled in its ``finally``.  Unlike the old task
+        it never polls — it parks on ``event.wait()`` and only wakes when
+        :meth:`_fire` (or :meth:`close`) signals it.
+        """
+        try:
+            while not self._closed:
+                await self._flush_evt.wait()
+                self._flush_evt.clear()
+                if self._closed:
+                    return
+                await self._handler._flush_both(
+                    self._client_io, self._target_io,
+                    self._client_h2, self._target_h2,
+                )
+        except asyncio.CancelledError:
+            pass
+
+
+# ============================================================================
 # HTTP/2 Handler
 # ============================================================================
 
@@ -228,6 +485,7 @@ class Http2Handler:
         target_h2: h2.connection.H2Connection,
         streams: _StreamMap,
         captures: dict[int, _ResponseCapture],
+        overread: bytes = b"",
     ) -> None:
         """Main HTTP/2 forwarding loop.
 
@@ -243,14 +501,69 @@ class Http2Handler:
         """
         logger.debug("[HTTP/2 %s] Handler started", target_host)
         timeout_task: Optional[asyncio.Task[None]] = None
+        reaper: Optional[_StreamReaper] = None
         draining: set[h2.connection.H2Connection] = set()
 
         try:
+            # Event-driven idle-stream reaper.  Created before the over-read
+            # block below because that path can already create (and must
+            # therefore arm) the first stream.
+            reaper = _StreamReaper(
+                asyncio.get_running_loop(),
+                self.config.stream_timeout,
+                self,
+                client_h2, target_h2, client_io, target_io,
+                streams, captures,
+            )
+            # If start_session over-read past the preface (Chrome routinely
+            # packs the HEADERS frame for the first request into the same
+            # TLS record as the preface), feed those bytes into client_h2
+            # here and process the resulting events through the normal
+            # client-event handler before the pump tasks start.  Without
+            # this, the bytes are gone from the socket but their events
+            # were never fired, and the pump loop sits idle waiting for a
+            # request the browser has already sent.
+            if overread:
+                logger.debug(
+                    "[HTTP/2 %s] Processing %d over-read byte(s) from "
+                    "preface: %s",
+                    target_host, len(overread),
+                    self._summarize_h2_frames(overread)[0],
+                )
+                try:
+                    early_events = client_h2.receive_data(overread)
+                except h2.exceptions.ProtocolError as e:
+                    logger.warning(
+                        "[HTTP/2 %s] Preface over-read produced "
+                        "ProtocolError: %s",
+                        target_host, e,
+                    )
+                    early_events = []
+                for event in early_events:
+                    try:
+                        await self._process_client_event(
+                            event, client_h2, target_h2,
+                            streams, captures, draining, target_host,
+                            reaper,
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:
+                        logger.warning(
+                            "[HTTP/2] Error processing early client "
+                            "event %s: %s",
+                            type(event).__name__, e,
+                        )
+                await self._flush_both(
+                    client_io, target_io, client_h2, target_h2,
+                )
+
             client_task = asyncio.create_task(
                 self._pump(
                     "client",
                     client_io, target_io, client_h2, target_h2,
                     streams, captures, draining, target_host,
+                    reaper,
                 )
             )
             target_task = asyncio.create_task(
@@ -258,23 +571,44 @@ class Http2Handler:
                     "target",
                     client_io, target_io, client_h2, target_h2,
                     streams, captures, draining, target_host,
+                    reaper,
                 )
             )
-            timeout_task = asyncio.create_task(
-                self._check_stream_timeouts(
-                    streams, captures, client_h2, target_h2, client_io, target_io
-                )
-            )
+            # Event-driven flush task for the reaper's RST frames.  Replaces
+            # the old polling _check_stream_timeouts task; same lifecycle
+            # (cancelled in the finally below).
+            timeout_task = asyncio.create_task(reaper.run())
 
+            handler_start_t = time.monotonic()
             done, pending = await asyncio.wait(
                 [client_task, target_task],
                 return_when=asyncio.FIRST_COMPLETED,
             )
+            wait_returned_t = time.monotonic()
+            logger.debug(
+                "[HTTP/2 %s] handle: asyncio.wait returned after %.1fs "
+                "done=%d pending=%d",
+                target_host, wait_returned_t - handler_start_t,
+                len(done), len(pending),
+            )
 
             for t in done:
+                # Identify which pump finished (by checking the task's
+                # coroutine name parameter would be ideal but isn't
+                # robustly available; instead, both tasks log their own
+                # exit reasons inside _pump, so just emit done/exception
+                # here for correlation).
                 exc = t.exception()
-                if exc:
-                    logger.debug("[HTTP/2 %s] Task exc: %s", target_host, exc)
+                if exc is not None:
+                    logger.debug(
+                        "[HTTP/2 %s] handle: completed task raised %s: %s",
+                        target_host, type(exc).__name__, exc,
+                    )
+                else:
+                    logger.debug(
+                        "[HTTP/2 %s] handle: completed task returned cleanly",
+                        target_host,
+                    )
 
             for t in pending:
                 t.cancel()
@@ -282,6 +616,12 @@ class Http2Handler:
                     await t
                 except asyncio.CancelledError:
                     pass
+                except Exception as e:
+                    logger.debug(
+                        "[HTTP/2 %s] handle: pending task cancel raised "
+                        "%s: %s",
+                        target_host, type(e).__name__, e,
+                    )
 
             # GOAWAY frames buffered by _process_*_event are flushed to
             # both sides on each pump iteration via _flush_both, so by
@@ -290,6 +630,7 @@ class Http2Handler:
             # needed.
 
         except asyncio.CancelledError:
+            logger.debug("[HTTP/2 %s] handle: cancelled", target_host)
             raise
         except Exception as e:
             logger.error(
@@ -299,12 +640,30 @@ class Http2Handler:
                 traceback.format_exc(),
             )
         finally:
+            # Diagnostic: if this log appears but "Handler stopped" never
+            # does, the hang is somewhere in the cleanup below — most
+            # likely timeout_task.cancel() not unblocking, or a deliver
+            # callback hanging.
+            logger.debug(
+                "[HTTP/2 %s] handle: entering finally cleanup", target_host
+            )
+            # Cancel every outstanding per-stream reap timer first, so no
+            # _fire callback can run during/after teardown, then unblock
+            # and cancel the flush task.
+            if reaper is not None:
+                reaper.close()
             if timeout_task:
                 timeout_task.cancel()
                 try:
                     await timeout_task
                 except asyncio.CancelledError:
                     pass
+                except Exception as e:
+                    logger.debug(
+                        "[HTTP/2 %s] handle: timeout_task await raised "
+                        "%s: %s",
+                        target_host, type(e).__name__, e,
+                    )
             logger.debug("[HTTP/2 %s] Handler stopped", target_host)
 
             # FIX: Deliver partial captures for in-flight streams so that
@@ -315,6 +674,51 @@ class Http2Handler:
                     self._proxy.policy.deliver_capture(capture)
             captures.clear()
             streams.clear()
+
+    @staticmethod
+    def _sync_h2_internal_state_from_local_settings(
+        conn: h2.connection.H2Connection,
+    ) -> None:
+        """Sync h2's internal fields that depend on ``local_settings``.
+
+        h2 normally updates these fields inside ``_local_settings_acked``,
+        which runs when the **peer** ACKs a SETTINGS frame we sent.
+        The two preface builders bypass that flow entirely: they replace
+        ``conn.local_settings`` wholesale before ``initiate_connection``
+        and then discard h2's emitted bytes so the proxy can forward the
+        browser's exact preface instead.  No SETTINGS exchange happens,
+        no ACK arrives, and ``_local_settings_acked`` never fires —
+        leaving the dependent internal fields stale at their defaults.
+
+        This helper performs the same sync ``_local_settings_acked``
+        would do, for the subset that matters at preface time (i.e.
+        before any streams exist):
+
+        * ``decoder.max_allowed_table_size`` (HEADER_TABLE_SIZE) —
+          without this, the HPACK decoder rejects table indices the
+          peer's encoder thinks are valid: "Invalid table index N".
+        * ``decoder.max_header_list_size`` (MAX_HEADER_LIST_SIZE) —
+          without this, large headers (long Cookie, big User-Agent +
+          client hints) are rejected with HEADER_LIST_TOO_LARGE.
+        * ``max_inbound_frame_size`` (MAX_FRAME_SIZE) — without this,
+          frames larger than the 16384-byte spec default get rejected
+          with FRAME_SIZE_ERROR.  Browsers usually keep the default, so
+          this rarely triggers, but Chrome can negotiate larger.
+
+        INITIAL_WINDOW_SIZE is intentionally NOT handled here: it only
+        affects existing stream windows (§6.9.2), and no streams exist
+        at preface time.  Once streams are created they pick up the
+        right initial window from ``local_settings`` directly.
+
+        Keep this list in sync with h2's ``_local_settings_acked`` if
+        you upgrade the h2 library.
+        """
+        ls = conn.local_settings
+        conn.decoder.max_allowed_table_size = ls.header_table_size
+        mhls = ls.max_header_list_size
+        if mhls is not None:
+            conn.decoder.max_header_list_size = mhls
+        conn.max_inbound_frame_size = ls.max_frame_size
 
     @staticmethod
     def _build_client_h2(
@@ -360,18 +764,20 @@ class Http2Handler:
                 h2.settings.SettingCodes.ENABLE_PUSH: 0,
             }
             mcs = mirror_from.max_concurrent_streams
-            # h2 returns 2**32+1 (effectively unlimited) when the peer
-            # didn't send MAX_CONCURRENT_STREAMS.  Only mirror values
-            # that look like a real per-peer limit; otherwise fall back
-            # to Chrome's typical advertised cap of 100.
-            if mcs < 1024:
+            # h2 reports a sentinel (2**32+1) when the peer didn't send
+            # MAX_CONCURRENT_STREAMS.  Mirror any value that looks like a
+            # real per-peer limit; otherwise fall back to Chrome's typical
+            # advertised cap.  (The previous < 1024 heuristic silently
+            # clamped a target advertising e.g. 2000 streams down to 100;
+            # the threshold now only rejects the unset sentinel.)
+            if mcs < _H2_UNSET_CONCURRENT_STREAMS_THRESHOLD:
                 initial_values[
                     h2.settings.SettingCodes.MAX_CONCURRENT_STREAMS
                 ] = mcs
             else:
                 initial_values[
                     h2.settings.SettingCodes.MAX_CONCURRENT_STREAMS
-                ] = 100
+                ] = _DEFAULT_MAX_CONCURRENT_STREAMS
             mhls = mirror_from.max_header_list_size
             if mhls is not None:
                 initial_values[
@@ -382,24 +788,21 @@ class Http2Handler:
                 client=False,
                 initial_values=initial_values,
             )
-            # Sync the HPACK decoder to the mirrored table size.  h2
-            # doesn't auto-update this when local_settings is replaced
-            # post-construction.  Mismatch causes "Invalid table index
-            # N" errors when the browser's encoder thinks the table is
-            # bigger than our decoder allows.
-            conn.decoder.max_allowed_table_size = mirror_from.header_table_size
-            if mhls is not None:
-                conn.decoder.max_header_list_size = mhls
+            # Sync h2's internal fields that mirror local_settings.
+            # See the helper's docstring for why this is necessary when
+            # we replace local_settings wholesale instead of going via
+            # update_settings().
+            Http2Handler._sync_h2_internal_state_from_local_settings(conn)
 
         conn.initiate_connection()
-        conn.increment_flow_control_window(15663105)
+        conn.increment_flow_control_window(_BROWSER_FACING_RECV_WINDOW_INCREMENT)
         return conn
 
     @staticmethod
     async def _read_browser_preface(
         client_io: ManagedConnection,
         timeout: float = 10.0,
-    ) -> tuple[bytes, dict[int, int], int]:
+    ) -> tuple[bytes, dict[int, int], int, bytes]:
         """Read the browser's HTTP/2 connection preface from the socket.
 
         The browser sends its preface as soon as TLS completes per
@@ -408,11 +811,12 @@ class Http2Handler:
         stream 0 (Chrome does this to bump the connection-level
         receive window).
 
-        Returns ``(raw_bytes, settings_dict, connection_window_increment)``:
+        Returns ``(raw_bytes, settings_dict, connection_window_increment,
+        overread)``:
 
-        * ``raw_bytes`` — the exact bytes the browser sent.  These get
-          forwarded verbatim to the target so the target sees the
-          browser's true h2 fingerprint (Akamai H2 hash etc.) without
+        * ``raw_bytes`` — the exact preface bytes the browser sent.
+          These get forwarded verbatim to the target so the target sees
+          the browser's true h2 fingerprint (Akamai H2 hash etc.) without
           us having to maintain a hand-rolled approximation that could
           drift with Chrome version updates.
         * ``settings_dict`` — the SETTINGS values parsed from the frame,
@@ -422,6 +826,13 @@ class Http2Handler:
           WINDOW_UPDATE on stream 0, or 0 if absent.  Applied via
           ``increment_flow_control_window`` to keep h2's accounting
           aligned with what the browser actually sent.
+        * ``overread`` — bytes the asyncio reader returned past the
+          preface (Chrome routinely packs the HEADERS frame for the
+          first request into the same TLS record as the preface, and
+          we have no way to push them back onto the StreamReader).
+          The caller must feed these into ``client_h2.receive_data``
+          and process the resulting events; otherwise the first request
+          is silently dropped and the connection deadlocks.
 
         Cost
         ~~~~
@@ -460,14 +871,15 @@ class Http2Handler:
         magic: bytes,
         already_buffered: bytes,
         timeout: float,
-    ) -> tuple[bytes, dict[int, int], int]:
+    ) -> tuple[bytes, dict[int, int], int, bytes]:
         """Parse SETTINGS [+ WINDOW_UPDATE] frames following the magic string.
 
         Implementation half of :meth:`_read_browser_preface`.  Reads
         until both control frames are consumed (SETTINGS is required,
         WINDOW_UPDATE is optional), then stops — leaving any subsequent
-        HEADERS/DATA frames on the socket for ``_pump`` to consume
-        normally.
+        HEADERS/DATA frames *in the local buffer* (asyncio's StreamReader
+        has no put-back), which the caller must re-feed to client_h2 via
+        the ``overread`` return value.
 
         Per RFC 7540 §4.1, every frame is:
 
@@ -502,7 +914,7 @@ class Http2Handler:
                 await _ensure_buffered(9)
             except ConnectionError:
                 if settings_seen:
-                    return bytes(buf[:cursor]), settings_dict, window_increment
+                    return bytes(buf[:cursor]), settings_dict, window_increment, b""
                 raise
 
             length = int.from_bytes(buf[cursor:cursor + 3], "big")
@@ -548,7 +960,18 @@ class Http2Handler:
             # over.  Don't consume this frame; leave it on the socket.
             break
 
-        return bytes(buf[:cursor]), settings_dict, window_increment
+        # Capture any bytes the asyncio reader returned past the preface.
+        # Chrome typically packs the HEADERS frame for the first request
+        # into the same TLS record as the preface, and asyncio's
+        # StreamReader has no put-back primitive — the bytes we read
+        # past ``cursor`` are sitting in the local ``buf`` with no way
+        # to get them back onto the socket.  The caller (handle()) must
+        # feed ``overread`` to client_h2.receive_data and process the
+        # resulting events before the pump loop starts; otherwise the
+        # first request is silently dropped and the connection deadlocks
+        # until the idle timeout fires.
+        overread = bytes(buf[cursor:])
+        return bytes(buf[:cursor]), settings_dict, window_increment, overread
 
     @staticmethod
     def _build_target_h2_from_browser_preface(
@@ -593,18 +1016,11 @@ class Http2Handler:
                 client=True,
                 initial_values=initial_values,
             )
-            # Sync the HPACK decoder to whatever HEADER_TABLE_SIZE the
-            # browser declared.  h2 doesn't auto-update it when
-            # local_settings is replaced post-construction.
-            table_size = initial_values.get(
-                h2.settings.SettingCodes.HEADER_TABLE_SIZE, 4096
-            )
-            conn.decoder.max_allowed_table_size = table_size
-            mhls = initial_values.get(
-                h2.settings.SettingCodes.MAX_HEADER_LIST_SIZE
-            )
-            if mhls is not None:
-                conn.decoder.max_header_list_size = mhls
+            # Sync h2's internal fields that mirror local_settings.
+            # See the helper's docstring for why this is necessary when
+            # we replace local_settings wholesale instead of going via
+            # update_settings().
+            Http2Handler._sync_h2_internal_state_from_local_settings(conn)
 
         conn.initiate_connection()
         # Discard h2's own preface bytes — we'll write the browser's
@@ -661,9 +1077,12 @@ class Http2Handler:
         # forwarding rather than hand-rolling — we must wait for the
         # browser to send before we can forward to the target.
         try:
-            browser_preface_bytes, browser_settings, conn_window_inc = (
-                await self._read_browser_preface(client_io)
-            )
+            (
+                browser_preface_bytes,
+                browser_settings,
+                conn_window_inc,
+                overread,
+            ) = await self._read_browser_preface(client_io)
         except asyncio.TimeoutError:
             # ``asyncio.TimeoutError`` has no message text; the bare "%s"
             # used to log "read failed: " with nothing after the colon.
@@ -698,16 +1117,37 @@ class Http2Handler:
             target_io.writer.write(browser_preface_bytes)
             await target_io.writer.drain()
 
-            # Step 3: Read target's SETTINGS so we can mirror them to
-            # the browser side.
+            # Step 3: Read the target's SETTINGS so we can mirror them
+            # to the browser side.  SETTINGS is tiny and almost always
+            # lands in the first read, but a fragmented TLS record could
+            # split it — and mirroring from a half-parsed remote_settings
+            # in step 4 would mis-size the browser's window.  Loop until
+            # h2 reports it actually parsed a SETTINGS frame
+            # (RemoteSettingsChanged) or the target closes first.  The 5s
+            # budget now bounds the whole handshake rather than a single
+            # read.  Any extra frames the target piggybacks here are fed
+            # to h2's internal buffer; their events are safe to ignore
+            # because no streams exist yet.
+            settings_seen = False
             async with asyncio.timeout(5.0):
-                data = await target_io.reader.read(self.config.read_buffer_size)
-                if data:
-                    target_h2.receive_data(data)
+                while not settings_seen:
+                    data = await target_io.reader.read(
+                        self.config.read_buffer_size
+                    )
+                    if not data:
+                        # Target closed before completing its preface;
+                        # proceed best-effort with the settings we have.
+                        break
+                    events = target_h2.receive_data(data)
                     ack = target_h2.data_to_send()
                     if ack:
                         target_io.writer.write(ack)
                         await target_io.writer.drain()
+                    if any(
+                        isinstance(e, h2.events.RemoteSettingsChanged)
+                        for e in events
+                    ):
+                        settings_seen = True
 
             # Step 4: Build browser-facing h2 with mirrored SETTINGS so
             # the browser's outgoing window is aligned with what the
@@ -750,6 +1190,7 @@ class Http2Handler:
                 await self.handle(
                     client_io, target_io, target_host,
                     client_h2, target_h2, streams, captures,
+                    overread=overread,
                 )
             finally:
                 self._proxy._untrack_h2_state(
@@ -771,51 +1212,6 @@ class Http2Handler:
 
     # -- internal ----------------------------------------------------------
 
-    async def _check_stream_timeouts(
-        self,
-        streams: _StreamMap,
-        captures: dict[int, _ResponseCapture],
-        client_h2: h2.connection.H2Connection,
-        target_h2: h2.connection.H2Connection,
-        client_io: ManagedConnection,
-        target_io: ManagedConnection,
-    ) -> None:
-        """Periodically RST_STREAM any streams that have exceeded the timeout.
-
-        Also pops the capture for each timed-out stream and delivers it if
-        partial data was received — otherwise interceptors blocked on
-        ``capture.get()`` would wait the full configured timeout instead
-        of getting an early notification.
-        """
-        try:
-            while True:
-                await asyncio.sleep(30)
-                now = time.monotonic()
-                timed_out = [
-                    s
-                    for s in streams.values()
-                    if now - s.created_at > self.config.stream_timeout
-                ]
-                for s in timed_out:
-                    try:
-                        client_h2.reset_stream(s.client_stream_id, error_code=8)
-                        target_h2.reset_stream(s.target_stream_id, error_code=8)
-                    except Exception as e:
-                        logger.trace(
-                            "stream-timeout reset failed (client=%d, target=%d): %s",
-                            s.client_stream_id, s.target_stream_id, e,
-                        )
-                    self._finish_stream(
-                        s.client_stream_id, streams, captures,
-                        deliver_partial=True,
-                    )
-                if timed_out:
-                    await self._flush_both(
-                        client_io, target_io, client_h2, target_h2
-                    )
-        except asyncio.CancelledError:
-            pass
-
     async def _pump(
         self,
         side: str,  # "client" or "target"
@@ -827,6 +1223,7 @@ class Http2Handler:
         captures: dict[int, _ResponseCapture],
         draining: set[h2.connection.H2Connection],
         target_host: str,
+        reaper: "_StreamReaper",
     ) -> None:
         """Read loop for one side of the h2 session.
 
@@ -852,6 +1249,21 @@ class Http2Handler:
         # lifetime of the connection object and uniquely identifies it.
         sid = f"{id(h2_in) & 0xFFFFFF:06x}"
 
+        # Diagnostic: track *why* this pump exits.  When a handler
+        # appears to hang (logs go silent without the customary "Handler
+        # stopped" message), grepping for this pump's "pump exit" line
+        # tells us whether the pump even reached its break statement, or
+        # whether it's wedged on an await somewhere in the loop body.
+        # Counter-paired with "pump start" so we can match them up.
+        pump_start_t = time.monotonic()
+        exit_reason = "io_in_closed"  # if loop never enters
+        reads_total = 0
+        bytes_total = 0
+        logger.debug(
+            "[HTTP/2 %s sid=%s] pump start (idle_timeout=%.1fs target=%s)",
+            side, sid, self.config.idle_timeout, target_host,
+        )
+
         # Rolling history of frame summaries for diagnostic dumps when
         # something goes wrong.  Keeps the last N frames received on
         # this side; on ProtocolError we dump them to show what led up
@@ -860,37 +1272,59 @@ class Http2Handler:
         recent_frames: list[str] = []
         max_recent = 32
 
-        while not io_in.closed:
+        # Cross-buffer state for the frame summarizer.  TCP reads chop
+        # frame boundaries arbitrarily, so we have to remember how much
+        # of the next frame's body still needs to arrive
+        # (``pending_body``) and any 0-8 byte fragment of the next
+        # frame's header that arrived at the tail of the prior buffer
+        # (``header_fragment``).  See ``_summarize_h2_frames``.
+        pending_body = 0
+        header_fragment = b""
+
+        try:
+          while not io_in.closed:
             try:
                 async with asyncio.timeout(self.config.idle_timeout):
                     data = await io_in.reader.read(self.config.read_buffer_size)
             except asyncio.TimeoutError:
+                exit_reason = "idle_timeout"
                 break
             if not data:
+                exit_reason = "eof"
                 break
             io_in.touch()
+            reads_total += 1
+            bytes_total += len(data)
 
-            # Per-buffer trace at TRACE level — very chatty, only useful
-            # when actively debugging.  Keep behind isEnabledFor so we
-            # don't pay the parsing cost when TRACE is off.
+            # Single parse per buffer, used for both the chatty TRACE
+            # log and the recent_frames ring buffer.  State threaded
+            # through across reads so frame boundaries stay correct.
+            try:
+                summary, pending_body, header_fragment = (
+                    self._summarize_h2_frames(
+                        data,
+                        prior_body_remaining=pending_body,
+                        prior_header_fragment=header_fragment,
+                        max_frames=8,
+                    )
+                )
+            except Exception:
+                # Frame parsing failed — don't let diagnostics crash
+                # the pump loop.  Reset state so we don't compound the
+                # error on the next read.
+                summary = "<summarizer error>"
+                pending_body = 0
+                header_fragment = b""
+
             if logger.isEnabledFor(5):
                 logger.trace(
                     "[HTTP/2 %s sid=%s] %d bytes received: %s",
-                    side, sid, len(data),
-                    self._summarize_h2_frames(data),
+                    side, sid, len(data), summary,
                 )
 
-            # Maintain the rolling recent-frames buffer regardless of
-            # log level — needed for the ProtocolError dump below.
-            try:
-                summary = self._summarize_h2_frames(data, max_frames=8)
-                recent_frames.append(summary)
-                if len(recent_frames) > max_recent:
-                    del recent_frames[0]
-            except Exception:
-                # Frame parsing failed — don't let diagnostics crash
-                # the pump loop.
-                pass
+            recent_frames.append(summary)
+            if len(recent_frames) > max_recent:
+                del recent_frames[0]
 
             # If the state machine is already CLOSED, feeding more data
             # into receive_data() is just going to produce ProtocolError
@@ -909,6 +1343,7 @@ class Http2Handler:
                         "(remaining %d bytes ignored)",
                         side, sid, len(data),
                     )
+                    exit_reason = "h2_state_closed"
                     break
             except Exception:
                 pass
@@ -937,9 +1372,10 @@ class Http2Handler:
                     "  recent_frames (oldest first):\n    %s",
                     side, sid, e,
                     conn_state,
-                    self._summarize_h2_frames(data),
+                    summary,
                     "\n    ".join(recent_frames) or "(none)",
                 )
+                exit_reason = "protocol_error"
                 break
 
             for event in events:
@@ -948,6 +1384,7 @@ class Http2Handler:
                         await self._process_client_event(
                             event, client_h2, target_h2,
                             streams, captures, draining, target_host,
+                            reaper,
                         )
                     else:
                         await self._process_target_event(
@@ -963,9 +1400,39 @@ class Http2Handler:
                     )
 
             await self._flush_both(client_io, target_io, client_h2, target_h2)
+        except asyncio.CancelledError:
+            exit_reason = "cancelled"
+            raise
+        except BaseException as e:
+            # Catch BaseException (not just Exception) so any escape from
+            # the loop body — including the GeneratorExit / SystemExit
+            # paths that might escape from inside an asyncio.timeout —
+            # leaves a forensic trail rather than silently terminating
+            # the task.  We re-raise after logging so cancellation /
+            # shutdown propagate normally.
+            exit_reason = f"exception:{type(e).__name__}"
+            logger.warning(
+                "[HTTP/2 %s sid=%s] pump escaped via %s: %s",
+                side, sid, type(e).__name__, e,
+            )
+            raise
+        finally:
+            lifetime = time.monotonic() - pump_start_t
+            logger.debug(
+                "[HTTP/2 %s sid=%s] pump exit reason=%s lifetime=%.1fs "
+                "reads=%d bytes=%d io_in.closed=%s",
+                side, sid, exit_reason, lifetime,
+                reads_total, bytes_total, io_in.closed,
+            )
 
     @staticmethod
-    def _summarize_h2_frames(data: bytes, max_frames: int = 16) -> str:
+    def _summarize_h2_frames(
+        data: bytes,
+        *,
+        prior_body_remaining: int = 0,
+        prior_header_fragment: bytes = b"",
+        max_frames: int = 16,
+    ) -> tuple[str, int, bytes]:
         """Decode raw h2 wire bytes into a human-readable frame summary.
 
         Used for diagnostics when ``receive_data`` raises ProtocolError —
@@ -977,69 +1444,111 @@ class Http2Handler:
         Body bytes are NOT logged — only frame metadata.  Sensitive
         payload data (HEADERS, DATA) is summarised by length only.
 
+        Stateful across reads
+        ~~~~~~~~~~~~~~~~~~~~~
+        TCP reads chop frame boundaries arbitrarily — a single read may
+        end in the middle of a DATA body, or with only 4 bytes of the
+        next 9-byte frame header buffered.  Without carry-over state,
+        the next read's first 9 bytes get parsed as if they were a frame
+        header, producing nonsense like ``len=8533317`` (payload bytes
+        being misinterpreted as a length field).
+
+        Callers maintain two pieces of state across reads:
+
+        * ``prior_body_remaining`` — bytes of an in-progress frame body
+          that spilled past the prior buffer.  These are consumed first
+          before any parsing begins.
+        * ``prior_header_fragment`` — between 1 and 8 bytes of the next
+          frame's header that arrived at the tail of the prior buffer.
+          Prepended to *data* before parsing resumes.
+
+        Returns ``(summary, new_body_remaining, new_header_fragment)``.
+        Single-shot callers can pass nothing (defaults) and discard the
+        latter two return values.
+
         Returns a string like::
 
-            [SETTINGS s=0 f=0x00 len=18, HEADERS s=1 f=0x05 len=42, RST_STREAM s=3 f=0x00 len=4]
+            [SETTINGS s=0 f=0x00 len=18, HEADERS s=1 f=0x05 len=42,
+             RST_STREAM s=3 f=0x00 len=4]
 
         Truncates to *max_frames* entries with a "+N more" suffix to
         avoid enormous log lines on big buffers.
         """
         out: list[str] = []
-        view = memoryview(data)
-        cursor = 0
         truncated = 0
+        pos = 0  # position into the new *data* buffer
 
-        # Skip the connection preface magic if present.  The magic is
-        # not a frame and would otherwise be misinterpreted (its first
-        # 3 bytes 'PRI' look like a frame length of 5263945).
+        # 1. Consume any pending body bytes from a prior buffer first.
+        #    These look like DATA payload (or HEADERS continuation, etc.)
+        #    — we don't parse them, just note their presence.
+        if prior_body_remaining:
+            consume = min(prior_body_remaining, len(data))
+            out.append(f"<body cont. {consume}B>")
+            pos = consume
+            new_body_remaining = prior_body_remaining - consume
+            if new_body_remaining:
+                # Entire buffer was body continuation; nothing else to do.
+                return f"[{', '.join(out)}]", new_body_remaining, b""
+
+        # 2. Combine any leftover header bytes from the prior buffer
+        #    with the rest of this buffer.  The fragment is at most 8
+        #    bytes (a complete header is 9), so the cost is negligible.
+        work = prior_header_fragment + data[pos:]
+        wpos = 0
+
+        # 3. Skip the connection preface magic if present.  The magic is
+        #    not a frame and would otherwise be misinterpreted (its first
+        #    3 bytes 'PRI' look like a frame length of 5263945).
         magic = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
-        if data[:len(magic)] == magic:
+        if work[wpos:wpos + len(magic)] == magic:
             out.append("MAGIC")
-            cursor = len(magic)
+            wpos += len(magic)
 
-        while cursor + 9 <= len(view):
-            header = view[cursor:cursor + 9]
+        # 4. Parse complete frame headers; advance past their bodies.
+        while wpos + 9 <= len(work):
+            header = memoryview(work)[wpos:wpos + 9]
             try:
                 frame, body_len = _HF_Frame.parse_frame_header(header)
             except _HF_UnknownFrameError as e:
-                out.append(f"UNKNOWN(type=0x{e.frame_type:02x}) s=? len=?")
-                break
+                if len(out) < max_frames:
+                    out.append(
+                        f"UNKNOWN(type=0x{e.frame_type:02x}) s=? len=?"
+                    )
+                # Without a frame object we can't know body_len.  Best
+                # we can do is bail; reseting carry-over state means the
+                # next call starts fresh (and likely misaligned, but
+                # this branch indicates a corrupt stream anyway).
+                return f"[{', '.join(out)}]", 0, b""
             except Exception as e:
-                out.append(f"<parse error: {e}>")
-                break
+                if len(out) < max_frames:
+                    out.append(f"<parse error: {e}>")
+                return f"[{', '.join(out)}]", 0, b""
 
-            if cursor + 9 + body_len > len(view):
-                out.append(
-                    f"<incomplete: need {body_len} body bytes, "
-                    f"have {len(view) - cursor - 9}>"
-                )
-                break
+            if len(out) < max_frames:
+                ftype = type(frame).__name__.replace("Frame", "").upper() or "?"
+                flagstr = ",".join(frame.flags) or "-"
+                out.append(f"{ftype} s={frame.stream_id} f={flagstr} len={body_len}")
+            else:
+                truncated += 1
 
-            ftype = type(frame).__name__.replace("Frame", "").upper() or "?"
-            out.append(
-                f"{ftype} s={frame.stream_id} "
-                f"f=0x{int(frame.flags) if hasattr(frame.flags, '__int__') else 0:02x} " # pyright: ignore[reportArgumentType]
-                f"len={body_len}"
-            )
+            wpos += 9 + body_len
 
-            cursor += 9 + body_len
-            if len(out) >= max_frames:
-                # Count remaining without parsing
-                while cursor + 9 <= len(view):
-                    try:
-                        _, more_len = _HF_Frame.parse_frame_header(
-                            view[cursor:cursor + 9]
-                        )
-                        cursor += 9 + more_len
-                        truncated += 1
-                    except Exception:
-                        break
-                break
+        # 5. Compute carry-over state for the next call.
+        if wpos > len(work):
+            # Last frame's body extends past the buffer.
+            new_body_remaining = wpos - len(work)
+            new_header_fragment = b""
+        else:
+            # Anything left over (0–8 bytes) is the start of a header.
+            new_body_remaining = 0
+            new_header_fragment = bytes(work[wpos:])
 
         suffix = f", +{truncated} more" if truncated else ""
-        if cursor < len(view):
-            suffix += f" [{len(view) - cursor} trailing bytes]"
-        return "[" + ", ".join(out) + suffix + "]"
+        return (
+            f"[{', '.join(out)}{suffix}]",
+            new_body_remaining,
+            new_header_fragment,
+        )
 
     async def _flush_both(
         self,
@@ -1048,7 +1557,12 @@ class Http2Handler:
         client_h2: h2.connection.H2Connection,
         target_h2: h2.connection.H2Connection,
     ) -> None:
-        """Send any pending h2 frame data to both sides."""
+        """Send any pending h2 frame data to both sides.
+
+        Diagnostic: if ``writer.drain()`` blocks for more than a few
+        seconds, log a warning. Without this warning the
+        whole h2 pump would silently freeze with no log output.
+        """
         client_pending = client_h2.data_to_send()
         target_pending = target_h2.data_to_send()
         if client_pending and not client_io.closed:
@@ -1056,12 +1570,44 @@ class Http2Handler:
         if target_pending and not target_io.closed:
             target_io.writer.write(target_pending)
         coros = []
+        labels = []
         if client_pending and not client_io.closed:
             coros.append(client_io.writer.drain())
+            labels.append(f"client({len(client_pending)}B)")
         if target_pending and not target_io.closed:
             coros.append(target_io.writer.drain())
-        if coros:
-            await asyncio.gather(*coros, return_exceptions=True)
+            labels.append(f"target({len(target_pending)}B)")
+        if not coros:
+            return
+        # Wrap with a soft warning threshold.  We don't abort the drain
+        # because the proxy doesn't have a recovery path for partial
+        # writes, but we DO want to know if a drain takes a long time
+        flush_start = time.monotonic()
+        try:
+            results = await asyncio.wait_for(
+                asyncio.gather(*coros, return_exceptions=True),
+                timeout=30.0,
+            )
+            elapsed = time.monotonic() - flush_start
+            if elapsed > 5.0:
+                logger.warning(
+                    "[HTTP/2] _flush_both slow: %.1fs for %s",
+                    elapsed, "+".join(labels),
+                )
+            # Surface any drain() exceptions caught by gather.
+            for label, res in zip(labels, results):
+                if isinstance(res, BaseException):
+                    logger.debug(
+                        "[HTTP/2] _flush_both drain() %s raised %s: %s",
+                        label, type(res).__name__, res,
+                    )
+        except asyncio.TimeoutError:
+            elapsed = time.monotonic() - flush_start
+            logger.error(
+                "[HTTP/2] _flush_both HARD TIMEOUT after %.1fs on %s — "
+                "transport likely wedged",
+                elapsed, "+".join(labels),
+            )
 
     async def _handle_goaway(
         self,
@@ -1111,7 +1657,10 @@ class Http2Handler:
             ]
             for stream in doomed:
                 try:
-                    to_h2.reset_stream(getattr(stream, to_attr), error_code=7)
+                    to_h2.reset_stream(
+                        getattr(stream, to_attr),
+                        error_code=h2.errors.ErrorCodes.REFUSED_STREAM,
+                    )
                 except Exception as e:
                     logger.trace(
                         "%s-GOAWAY reset failed (%s=%d): %s",
@@ -1192,6 +1741,12 @@ class Http2Handler:
         status code — used during GOAWAY teardown where we want to surface
         partial responses but not empty placeholders.
         """
+        # Cancel this stream's idle-reap timer before it leaves the map.
+        # Centralised here so every finish path (StreamEnded, RST, GOAWAY,
+        # and the reaper's own _fire) releases the TimerHandle exactly once.
+        stream = streams.get_by_client(client_stream_id)
+        if stream is not None:
+            _StreamReaper.disarm(stream)
         capture = captures.pop(client_stream_id, None)
         if capture is not None:
             if not deliver_partial or capture.status_code:
@@ -1207,11 +1762,7 @@ class Http2Handler:
         sender_payload_length: int,
         receiver_h2: h2.connection.H2Connection,
         receiver_stream_id: int,
-        pending_buffer: bytearray,
-        get_pending_end: Callable[[], bool],
-        set_pending_end: Callable[[bool], None],
-        get_deferred_ack: Callable[[], int],
-        set_deferred_ack: Callable[[int], None],
+        direction: "_Direction",
     ) -> None:
         """Forward DATA from one h2 connection to another with end-to-end
         backpressure.
@@ -1227,7 +1778,7 @@ class Http2Handler:
         fully succeeds, ACK the original payload length so the sender
         gets its window back.  If forwarding only partially succeeds
         (window allows N < len bytes), send N bytes, queue the
-        remainder in *pending_buffer*, and accumulate the deferred-ACK
+        remainder in *direction.pending*, and accumulate the deferred-ACK
         amount.  When ``WindowUpdated`` later fires for this stream,
         :meth:`_drain_pending_with_backpressure` flushes the queue and
         releases the deferred ACK proportionally.
@@ -1243,11 +1794,11 @@ class Http2Handler:
         # If we already have queued data for this stream, append to the
         # tail to preserve ordering.  Don't try to send anything new —
         # let the WindowUpdated handler drain in order.
-        if pending_buffer:
-            pending_buffer.extend(data)
+        if direction.pending:
+            direction.pending.extend(data)
             if end_stream:
-                set_pending_end(True)
-            set_deferred_ack(get_deferred_ack() + sender_payload_length)
+                direction.pending_end = True
+            direction.deferred_ack += sender_payload_length
             return
 
         # Try to send the whole payload
@@ -1304,15 +1855,13 @@ class Http2Handler:
             ratio = sent / len(data)
             ack_now = int(sender_payload_length * ratio)
             sender_h2.acknowledge_received_data(ack_now, sender_stream_id)
-            set_deferred_ack(
-                get_deferred_ack() + (sender_payload_length - ack_now)
-            )
+            direction.deferred_ack += sender_payload_length - ack_now
         else:
-            set_deferred_ack(get_deferred_ack() + sender_payload_length)
+            direction.deferred_ack += sender_payload_length
 
-        pending_buffer.extend(data[sent:])
+        direction.pending.extend(data[sent:])
         if end_stream:
-            set_pending_end(True)
+            direction.pending_end = True
 
     @staticmethod
     def _drain_pending_with_backpressure(
@@ -1320,11 +1869,7 @@ class Http2Handler:
         sender_stream_id: int,
         receiver_h2: h2.connection.H2Connection,
         receiver_stream_id: int,
-        pending_buffer: bytearray,
-        get_pending_end: Callable[[], bool],
-        set_pending_end: Callable[[bool], None],
-        get_deferred_ack: Callable[[], int],
-        set_deferred_ack: Callable[[int], None],
+        direction: "_Direction",
     ) -> bool:
         """Flush as much of the pending buffer as the receiver's window
         now allows, releasing deferred ACKs proportionally.
@@ -1332,7 +1877,7 @@ class Http2Handler:
         Returns ``True`` if the buffer was fully drained (the caller can
         then clear ``pending_*_end`` and treat the stream as caught up).
         """
-        if not pending_buffer:
+        if not direction.pending:
             return True
 
         try:
@@ -1343,16 +1888,16 @@ class Http2Handler:
         if window <= 0:
             return False
 
-        starting_pending = len(pending_buffer)
-        starting_deferred = get_deferred_ack()
+        starting_pending = len(direction.pending)
+        starting_deferred = direction.deferred_ack
 
-        if len(pending_buffer) <= window:
+        if len(direction.pending) <= window:
             # Drain it all.  END_STREAM goes on the final flush.
-            chunk = bytes(pending_buffer)
+            chunk = bytes(direction.pending)
             try:
                 receiver_h2.send_data(
                     receiver_stream_id, chunk,
-                    end_stream=get_pending_end(),
+                    end_stream=direction.pending_end,
                 )
             except Exception as e:
                 logger.trace(
@@ -1360,18 +1905,18 @@ class Http2Handler:
                     receiver_stream_id, e,
                 )
                 return False
-            pending_buffer.clear()
+            direction.pending.clear()
             # Release the entire deferred ACK
             if starting_deferred > 0:
                 sender_h2.acknowledge_received_data(
                     starting_deferred, sender_stream_id,
                 )
-                set_deferred_ack(0)
+                direction.deferred_ack = 0
             return True
 
         # Partial drain
-        chunk = bytes(pending_buffer[:window])
-        del pending_buffer[:window]
+        chunk = bytes(direction.pending[:window])
+        del direction.pending[:window]
         try:
             receiver_h2.send_data(receiver_stream_id, chunk, end_stream=False)
         except Exception as e:
@@ -1389,7 +1934,7 @@ class Http2Handler:
                 sender_h2.acknowledge_received_data(
                     ack_now, sender_stream_id,
                 )
-                set_deferred_ack(starting_deferred - ack_now)
+                direction.deferred_ack = starting_deferred - ack_now
         return False
 
     async def _process_client_event(
@@ -1401,8 +1946,30 @@ class Http2Handler:
         captures: dict[int, _ResponseCapture],
         draining: set[h2.connection.H2Connection],
         target_host: str,
+        reaper: "_StreamReaper",
     ) -> None:
-        """Handle a single h2 event from the browser side."""
+        """Handle a single h2 event from the browser side.
+
+        Concurrency invariant
+        ~~~~~~~~~~~~~~~~~~~~~~~
+        Two pump tasks (client→target and target→client) run on the same
+        event loop and both mutate the shared ``streams`` and ``captures``
+        maps.  This is safe because event processing never actually yields
+        to the loop.  The h2 calls in every branch are synchronous.  The
+        one ``await`` here — ``await self._handle_goaway(...)`` — looks
+        like a suspension point but isn't: ``_handle_goaway`` contains no
+        ``await`` of its own, so awaiting it drives the coroutine to
+        completion inline without ever returning control to the scheduler.
+        The other pump therefore cannot interleave, and event handling is
+        effectively atomic.
+
+        This is correct but fragile.  If you add a *real* suspension point
+        (socket I/O, ``asyncio.sleep``, an async lock, ``await`` on a
+        future) inside any branch here, in ``_process_target_event``, or
+        inside ``_handle_goaway``, the await starts genuinely yielding and
+        the other pump can observe half-updated shared state.  Take an
+        explicit lock or restructure before introducing one.
+        """
 
         if isinstance(event, h2.events.RequestReceived):
             client_stream_id = event.stream_id
@@ -1413,7 +1980,10 @@ class Http2Handler:
             # open a new CONNECT for the retry.
             if target_h2 in draining:
                 try:
-                    client_h2.reset_stream(client_stream_id, error_code=7)  # REFUSED_STREAM
+                    client_h2.reset_stream(
+                        client_stream_id,
+                        error_code=h2.errors.ErrorCodes.REFUSED_STREAM,
+                    )
                 except Exception as e:
                     logger.trace(
                         "REFUSED_STREAM reset failed (client_stream_id=%d): %s",
@@ -1422,15 +1992,18 @@ class Http2Handler:
                 return
 
             if len(streams) >= self.config.max_streams_per_connection:
-                client_h2.reset_stream(client_stream_id, error_code=7)
+                client_h2.reset_stream(
+                    client_stream_id,
+                    error_code=h2.errors.ErrorCodes.REFUSED_STREAM,
+                )
                 return
 
-            # h2's RequestReceived.headers is typed as list[tuple[bytes, bytes]].
-            # Decode directly; if h2 ever yields strings we'll get a clear
-            # AttributeError pointing right at this line.
+            # h2's RequestReceived.headers is typed as list[tuple[bytes, bytes]],
+            # but a policy could conceivably hand back str; route through
+            # _decode_header so this path uses the same normalisation as the
+            # response side instead of assuming bytes.
             headers: list[tuple[str, str]] = [
-                (k.decode("utf-8", errors="replace"),
-                 v.decode("utf-8", errors="replace"))
+                (_decode_header(k), _decode_header(v))
                 for k, v in event.headers
             ]
 
@@ -1441,7 +2014,10 @@ class Http2Handler:
             method = headers_lookup.get(":method")
 
             if not method:
-                client_h2.reset_stream(client_stream_id, error_code=1)
+                client_h2.reset_stream(
+                    client_stream_id,
+                    error_code=h2.errors.ErrorCodes.PROTOCOL_ERROR,
+                )
                 return
 
             url = f"{scheme}://{authority}{path}"
@@ -1467,6 +2043,7 @@ class Http2Handler:
                 created_at=time.monotonic(),
             )
             streams.add(stream)
+            reaper.arm(stream)
 
             # Start capture if URL is being intercepted
             capture = self._proxy.policy.open_capture(url)
@@ -1479,6 +2056,7 @@ class Http2Handler:
         elif isinstance(event, h2.events.DataReceived):
             stream = streams.get_by_client(event.stream_id)
             if stream:
+                stream.last_activity = time.monotonic()
                 # Backpressured forward: send to target FIRST, ACK
                 # browser only after we've actually moved bytes through.
                 # See ``_forward_data_with_backpressure`` for why naïve
@@ -1491,15 +2069,7 @@ class Http2Handler:
                     sender_payload_length=event.flow_controlled_length,
                     receiver_h2=target_h2,
                     receiver_stream_id=stream.target_stream_id,
-                    pending_buffer=stream.pending_to_target,
-                    get_pending_end=lambda s=stream: s.pending_to_target_end,
-                    set_pending_end=lambda v, s=stream: setattr(
-                        s, "pending_to_target_end", v
-                    ),
-                    get_deferred_ack=lambda s=stream: s.deferred_ack_to_client,
-                    set_deferred_ack=lambda v, s=stream: setattr(
-                        s, "deferred_ack_to_client", v
-                    ),
+                    direction=stream.to_target,
                 )
 
         elif isinstance(event, h2.events.StreamReset):
@@ -1540,6 +2110,85 @@ class Http2Handler:
                 captures=captures,
             )
 
+        elif isinstance(event, h2.events.PriorityUpdated):
+            # Browser sent a PRIORITY frame (or HEADERS with priority
+            # info).  RFC 9113 §5.3.1 deprecates HTTP/2 priority in
+            # favour of the Priority header — most modern servers ignore
+            # PRIORITY frames — but forwarding preserves the wire-level
+            # fingerprint Chrome presents to the origin.
+            #
+            # h2 emits PriorityUpdated for stream_id 0 in some edge
+            # cases; only forward when there is a known stream.
+            stream = streams.get_by_client(event.stream_id) if event.stream_id else None
+            if stream:
+                try:
+                    target_h2.prioritize(
+                        stream_id=stream.target_stream_id,
+                        weight=event.weight,
+                        depends_on=event.depends_on,
+                        exclusive=event.exclusive,
+                    )
+                except (h2.exceptions.ProtocolError, ValueError) as e:
+                    # prioritize() rejects self-dependency and other
+                    # malformed inputs; drop the frame rather than
+                    # tearing down the stream — PRIORITY is advisory.
+                    logger.trace(
+                        "PRIORITY forward dropped (client=%d, target=%d): %s",
+                        event.stream_id, stream.target_stream_id, e,
+                    )
+
+        elif isinstance(event, h2.events.RemoteSettingsChanged):
+            # Browser changed its SETTINGS mid-session (rare but legal
+            # per RFC 9113 §6.5).  The h2 library has already applied
+            # the change to client_h2's state — INITIAL_WINDOW_SIZE
+            # shifts, MAX_FRAME_SIZE constraint, HPACK encoder bound,
+            # etc., per §6.9.2 — and queued a SETTINGS ACK back to the
+            # browser.  We need to propagate the SAME change to target_h2
+            # so the target sees a consistent view.
+            #
+            # ``update_settings`` queues a SETTINGS frame on target_h2's
+            # outbound buffer.  h2 will apply the change to target_h2's
+            # local_settings when the target ACKs (per §6.5.3) — at that
+            # point ``_local_settings_acked`` runs and updates flow
+            # control, the HPACK decoder's max_allowed_table_size /
+            # max_header_list_size, and the inbound frame-size limit,
+            # all automatically.  We don't need to touch any of that
+            # ourselves; the wholesale-replacement trick used at startup
+            # in ``_build_client_h2`` / ``_build_target_h2_from_browser_preface``
+            # bypasses ``_local_settings_acked`` and requires manual
+            # syncing, but that doesn't apply here.
+            mirrored: dict[int, int] = {}
+            for setting_code, change in event.changed_settings.items():
+                code = int(setting_code)
+                # Skip ENABLE_PUSH: we pin it to 0 for the target at
+                # connection setup and don't re-enable mid-session.
+                if code == h2.settings.SettingCodes.ENABLE_PUSH:
+                    continue
+                mirrored[code] = change.new_value
+            if mirrored:
+                try:
+                    target_h2.update_settings(mirrored)
+                except h2.exceptions.ProtocolError as e:
+                    logger.warning(
+                        "[HTTP/2] failed to mirror browser SETTINGS to target: %s",
+                        e,
+                    )
+
+        elif isinstance(event, h2.events.PushedStreamReceived):
+            # Browser pushed a stream TO US.  This should never happen:
+            # clients don't initiate push, only servers do.  RFC 9113
+            # §8.4 — if a server (we look like one to the browser) does
+            # not enable push it will not receive PUSH_PROMISE, and we
+            # advertise ENABLE_PUSH=0.  Defensive RST in case some
+            # browser sends it anyway.
+            try:
+                client_h2.reset_stream(
+                    event.pushed_stream_id,
+                    error_code=h2.errors.ErrorCodes.REFUSED_STREAM,
+                )
+            except Exception as e:
+                logger.trace("RST of unexpected client push failed: %s", e)
+
         elif isinstance(event, h2.events.WindowUpdated):
             # Browser refilled the window for client_h2's outgoing direction
             # (proxy → browser).  Drain anything we have queued for the
@@ -1547,11 +2196,11 @@ class Http2Handler:
             target_streams_to_drain: list[Http2Stream] = []
             if event.stream_id == 0:
                 target_streams_to_drain = [
-                    s for s in streams.values() if s.pending_to_client
+                    s for s in streams.values() if s.to_client.pending
                 ]
             else:
                 s = streams.get_by_client(event.stream_id)
-                if s and s.pending_to_client:
+                if s and s.to_client.pending:
                     target_streams_to_drain = [s]
 
             for s in target_streams_to_drain:
@@ -1560,17 +2209,9 @@ class Http2Handler:
                     sender_stream_id=s.target_stream_id,
                     receiver_h2=client_h2,
                     receiver_stream_id=s.client_stream_id,
-                    pending_buffer=s.pending_to_client,
-                    get_pending_end=lambda ss=s: ss.pending_to_client_end,
-                    set_pending_end=lambda v, ss=s: setattr(
-                        ss, "pending_to_client_end", v
-                    ),
-                    get_deferred_ack=lambda ss=s: ss.deferred_ack_to_target,
-                    set_deferred_ack=lambda v, ss=s: setattr(
-                        ss, "deferred_ack_to_target", v
-                    ),
+                    direction=s.to_client,
                 )
-                if drained and s.pending_to_client_end:
+                if drained and s.to_client.pending_end:
                     # Queued END_STREAM has now been flushed; finish.
                     self._finish_stream(
                         s.client_stream_id, streams, captures,
@@ -1591,9 +2232,45 @@ class Http2Handler:
         previous O(n) linear scan.
         """
 
-        if isinstance(event, h2.events.ResponseReceived):
+        if isinstance(event, h2.events.InformationalResponseReceived):
+            # 1xx responses (100 Continue, 103 Early Hints, etc.) per
+            # RFC 9113 §8.1.  These arrive BEFORE the final response on
+            # the same stream and must not end the stream — the final
+            # 200/etc. follows.  h2 emits this as a distinct event class
+            # specifically so we don't accidentally treat the 1xx as the
+            # final response.
+            #
+            # Cloudflare and other modern CDNs use 103 Early Hints to
+            # preload critical CSS/JS before the origin produces the
+            # final response.  Dropping these silently (the prior
+            # behaviour) measurably slows page load on those sites.
             stream = streams.get_by_target(event.stream_id)
             if stream:
+                stream.last_activity = time.monotonic()
+                # send_headers without end_stream — the final response
+                # follows on the same stream.  ``filter_response_headers``
+                # is applied so policy (e.g. Alt-Svc stripping) runs
+                # uniformly on 1xx and 2xx alike.
+                filtered = self._proxy.policy.filter_response_headers(
+                    event.headers
+                )
+                try:
+                    client_h2.send_headers(
+                        stream.client_stream_id, filtered, end_stream=False,
+                    )
+                except h2.exceptions.ProtocolError as e:
+                    # h2 will reject a 1xx if state doesn't allow it
+                    # (e.g. final response already sent).  Log and drop;
+                    # the final response will still flow.
+                    logger.debug(
+                        "[HTTP/2] 1xx forward rejected (client_stream=%d): %s",
+                        stream.client_stream_id, e,
+                    )
+
+        elif isinstance(event, h2.events.ResponseReceived):
+            stream = streams.get_by_target(event.stream_id)
+            if stream:
+                stream.last_activity = time.monotonic()
                 # Policy-driven response header transformation
                 # (default: strips h3 from Alt-Svc).
                 filtered_headers = self._proxy.policy.filter_response_headers(
@@ -1607,12 +2284,8 @@ class Http2Handler:
                 capture = captures.get(stream.client_stream_id)
                 if capture:
                     for k, v in filtered_headers:
-                        key = (
-                            k.decode("utf-8", errors="replace") if isinstance(k, bytes) else k
-                        )
-                        val = (
-                            v.decode("utf-8", errors="replace") if isinstance(v, bytes) else v
-                        )
+                        key = _decode_header(k)
+                        val = _decode_header(v)
                         if key == ":status":
                             try:
                                 capture.status_code = int(val)
@@ -1627,9 +2300,18 @@ class Http2Handler:
         elif isinstance(event, h2.events.DataReceived):
             stream = streams.get_by_target(event.stream_id)
             if stream:
-                target_h2.acknowledge_received_data(
-                    event.flow_controlled_length, event.stream_id
-                )
+                stream.last_activity = time.monotonic()
+                # Do NOT pre-ACK here.  ``_forward_data_with_backpressure``
+                # owns the ``acknowledge_received_data`` call (see its
+                # docstring: "forward FIRST, ACK to sender SECOND").  A
+                # pre-ACK at this point double-acks target_h2's flow-
+                # control window: the origin sees +2N receive window
+                # advertised for every N bytes we actually consumed,
+                # oversends until ``to_client.pending`` overflows, and
+                # eventually tears the stream down with FLOW_CONTROL_ERROR.
+                # The client-side equivalent in _process_client_event
+                # correctly defers ACK'ing to the helper — keep this side
+                # symmetric.
                 end = event.stream_ended is not None
                 # Capture body bytes regardless of whether they get
                 # forwarded immediately — interception sees the full
@@ -1647,22 +2329,14 @@ class Http2Handler:
                     sender_payload_length=event.flow_controlled_length,
                     receiver_h2=client_h2,
                     receiver_stream_id=stream.client_stream_id,
-                    pending_buffer=stream.pending_to_client,
-                    get_pending_end=lambda s=stream: s.pending_to_client_end,
-                    set_pending_end=lambda v, s=stream: setattr(
-                        s, "pending_to_client_end", v
-                    ),
-                    get_deferred_ack=lambda s=stream: s.deferred_ack_to_target,
-                    set_deferred_ack=lambda v, s=stream: setattr(
-                        s, "deferred_ack_to_target", v
-                    ),
+                    direction=stream.to_client,
                 )
                 # Only finish the stream if END_STREAM was set AND the
                 # buffer is empty (i.e. the END_STREAM bit actually
-                # made it onto a frame).  If pending_to_client still has
+                # made it onto a frame).  If to_client still has
                 # bytes, the END_STREAM is queued and _drain_pending
                 # will fire it later.
-                if end and not stream.pending_to_client:
+                if end and not stream.to_client.pending:
                     self._finish_stream(
                         stream.client_stream_id, streams, captures,
                     )
@@ -1705,6 +2379,7 @@ class Http2Handler:
         elif isinstance(event, h2.events.TrailersReceived):
             stream = streams.get_by_target(event.stream_id)
             if stream:
+                stream.last_activity = time.monotonic()
                 client_h2.send_headers(
                     stream.client_stream_id, event.headers, end_stream=True
                 )
@@ -1724,6 +2399,78 @@ class Http2Handler:
                 captures=captures,
             )
 
+        elif isinstance(event, h2.events.PriorityUpdated):
+            # Target sent PRIORITY toward us.  Forward to the browser so
+            # the browser's stream dependency tree stays in sync with
+            # what the origin advertised.  Targets very rarely send
+            # PRIORITY (deprecated per RFC 9113 §5.3.1), but forward for
+            # completeness.
+            stream = streams.get_by_target(event.stream_id) if event.stream_id else None
+            if stream:
+                try:
+                    client_h2.prioritize(
+                        stream_id=stream.client_stream_id,
+                        weight=event.weight,
+                        depends_on=event.depends_on,
+                        exclusive=event.exclusive,
+                    )
+                except (h2.exceptions.ProtocolError, ValueError) as e:
+                    logger.trace(
+                        "PRIORITY forward dropped (target=%d, client=%d): %s",
+                        event.stream_id, stream.client_stream_id, e,
+                    )
+
+        elif isinstance(event, h2.events.RemoteSettingsChanged):
+            # Target changed its SETTINGS mid-session.  h2 has already
+            # applied the change to target_h2's state and queued a
+            # SETTINGS ACK back to the target.  Mirror toward the
+            # browser so its view stays consistent with the target.
+            # h2 handles flow-control adjustment, HPACK decoder sync,
+            # etc., on the browser's ACK — see the matching client-side
+            # branch for the full explanation.
+            mirrored: dict[int, int] = {}
+            for setting_code, change in event.changed_settings.items():
+                code = int(setting_code)
+                if code == h2.settings.SettingCodes.ENABLE_PUSH:
+                    # Don't propagate the target's ENABLE_PUSH choice to
+                    # the browser — the browser already declared its own
+                    # value at connection setup.  (And clients don't
+                    # accept ENABLE_PUSH from peers; SETTINGS frames
+                    # with ENABLE_PUSH set on a client receive are a
+                    # PROTOCOL_ERROR per §6.5.2.)
+                    continue
+                mirrored[code] = change.new_value
+            if mirrored:
+                try:
+                    client_h2.update_settings(mirrored)
+                except h2.exceptions.ProtocolError as e:
+                    logger.warning(
+                        "[HTTP/2] failed to mirror target SETTINGS to browser: %s",
+                        e,
+                    )
+
+        elif isinstance(event, h2.events.PushedStreamReceived):
+            # Target initiated a server push (PUSH_PROMISE).  We advertise
+            # ENABLE_PUSH=0 to the target in our initial SETTINGS so
+            # compliant origins never send these — but a non-compliant
+            # origin might.  Refuse the push by RST'ing it on the target
+            # side; this is per RFC 9113 §8.4 (a client that doesn't
+            # want a push refuses with REFUSED_STREAM).
+            #
+            # We don't try to forward the promise to the browser because
+            # the browser is also seeing ENABLE_PUSH=0 in our mirrored
+            # settings, so it wouldn't accept the push anyway.
+            try:
+                target_h2.reset_stream(
+                    event.pushed_stream_id,
+                    error_code=h2.errors.ErrorCodes.REFUSED_STREAM,
+                )
+            except Exception as e:
+                logger.trace(
+                    "RST of unwanted target push failed (pushed=%d): %s",
+                    event.pushed_stream_id, e,
+                )
+
         elif isinstance(event, h2.events.WindowUpdated):
             # Target refilled the window for target_h2's outgoing direction
             # (proxy → target).  Drain anything we have queued for the
@@ -1731,11 +2478,11 @@ class Http2Handler:
             target_streams_to_drain: list[Http2Stream] = []
             if event.stream_id == 0:
                 target_streams_to_drain = [
-                    s for s in streams.values() if s.pending_to_target
+                    s for s in streams.values() if s.to_target.pending
                 ]
             else:
                 s = streams.get_by_target(event.stream_id)
-                if s and s.pending_to_target:
+                if s and s.to_target.pending:
                     target_streams_to_drain = [s]
 
             for s in target_streams_to_drain:
@@ -1744,15 +2491,7 @@ class Http2Handler:
                     sender_stream_id=s.client_stream_id,
                     receiver_h2=target_h2,
                     receiver_stream_id=s.target_stream_id,
-                    pending_buffer=s.pending_to_target,
-                    get_pending_end=lambda ss=s: ss.pending_to_target_end,
-                    set_pending_end=lambda v, ss=s: setattr(
-                        ss, "pending_to_target_end", v
-                    ),
-                    get_deferred_ack=lambda ss=s: ss.deferred_ack_to_client,
-                    set_deferred_ack=lambda v, ss=s: setattr(
-                        ss, "deferred_ack_to_client", v
-                    ),
+                    direction=s.to_target,
                 )
                 if drained:
-                    s.pending_to_target_end = False
+                    s.to_target.pending_end = False

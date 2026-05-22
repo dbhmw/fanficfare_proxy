@@ -58,20 +58,46 @@ except ImportError:
 
 @dataclass
 class InterceptedResponse:
-    """A captured HTTP response with an auto-decompressed body.
+    """A captured HTTP response whose body is decompressed on access.
 
-    The ``body`` field is *always* decompressed (gzip, br, deflate,
-    zstd).  The original ``content_encoding`` is preserved for
-    informational purposes.
+    ``body`` returns the decompressed payload (gzip, br, deflate, zstd);
+    ``content_encoding`` preserves the original encoding for reference.
+
+    Lazy decompression
+    ~~~~~~~~~~~~~~~~~~~
+    The bytes are stored compressed and decompressed on *first access to
+    ``body``*, then cached.  This matters because captures are finalised
+    on the proxy's event-loop thread, but ``body`` is read by the
+    consumer on *their* thread — so decompressing a large (multi-MB)
+    response no longer stalls the proxy loop (and every other connection
+    on it) for the duration.  Reading ``status_code``/``headers`` never
+    triggers decompression.
+
+    ``raw_body`` exposes the undecoded bytes if a caller needs them.
     """
 
     url: str
     status_code: int
     headers: list[tuple[str, str]]
-    body: bytes
+    raw_body: bytes = field(repr=False)
     content_type: str
     content_encoding: str
     timestamp: float = field(default_factory=time.monotonic)
+    _decoded: Optional[bytes] = field(
+        default=None, init=False, repr=False, compare=False
+    )
+
+    @property
+    def body(self) -> bytes:
+        """Decompressed body. Decoded lazily on first access and cached.
+
+        Runs on the calling thread, not the proxy loop. Idempotent: a
+        concurrent double-decode (two threads racing first access) is
+        harmless — both produce identical bytes, last write wins.
+        """
+        if self._decoded is None:
+            self._decoded = _decompress_body(self.raw_body, self.content_encoding)
+        return self._decoded
 
 
 def _decompress_body(data: bytes, encoding: str) -> bytes:
@@ -150,14 +176,15 @@ class _ResponseCapture:
             elif kl == "content-encoding":
                 content_encoding = v
 
-        raw = bytes(self.body)
-        body = _decompress_body(raw, content_encoding)
-
+        # Store the raw (still-compressed) bytes; decompression is
+        # deferred to InterceptedResponse.body so it runs on the
+        # consumer's thread, not the proxy loop.  finalise() itself runs
+        # on the loop, so it must stay cheap.
         return InterceptedResponse(
             url=self.url,
             status_code=self.status_code,
             headers=list(self.headers),
-            body=body,
+            raw_body=bytes(self.body),
             content_type=content_type,
             content_encoding=content_encoding,
         )
