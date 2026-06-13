@@ -16,8 +16,9 @@ SOCKS configuration baked into the sidecar.
 
 The manager reads the sidecar's ``READY <addr>`` line on startup to
 learn the bound address.  If the sidecar crashes, the monitor loop
-detects the exit and restarts the process on the **same port** so that
-existing ``SessionProxy`` instances don't need to be reconfigured.
+detects the exit and restarts the process on the **same socket name**
+so that existing ``SessionProxy`` instances don't need to be
+reconfigured.
 
 Thread safety
 ~~~~~~~~~~~~~
@@ -197,16 +198,14 @@ class SidecarManager:
     ----------
     binary_path:
         Path to the compiled ``tls-sidecar`` Go binary.
-    listen_host:
-        Host for the sidecar to bind to.  Default ``127.0.0.1``.
-    listen_port:
-        Port to listen on.  ``0`` means OS-assigned (recommended).
+    socket_name:
+        Name of the abstract-namespace Unix domain socket the sidecar
+        binds (passed through as ``--listen``).  ``None`` (the default)
+        derives a per-process name, ``tls-sidecar-<pid>``.
     connect_timeout:
         Sidecar's timeout for TCP + SOCKS5 + TLS handshake (seconds).
     idle_timeout:
         Sidecar's pipe idle timeout (seconds).
-    stats_interval:
-        How often the sidecar logs internal stats (seconds).  0 disables.
     max_conns:
         Max concurrent connections.  0 means unlimited.
     auto_restart:
@@ -231,7 +230,6 @@ class SidecarManager:
         socket_name: Optional[str] = None,
         connect_timeout: float = 30.0,
         idle_timeout: float = 90.0,
-        stats_interval: float = 60.0,
         max_conns: int = 0,
         auto_restart: bool = True,
         restart_delay: float = 1.0,
@@ -246,7 +244,6 @@ class SidecarManager:
         self.socket_name = socket_name
         self.connect_timeout = connect_timeout
         self.idle_timeout = idle_timeout
-        self.stats_interval = stats_interval
         self.max_conns = max_conns
         self.auto_restart = auto_restart
         self.restart_delay = restart_delay
@@ -269,7 +266,7 @@ class SidecarManager:
 
     @property
     def addr(self) -> Optional[str]:
-        """The sidecar's bound address (``"127.0.0.1:PORT"``) or ``None``."""
+        """The sidecar's bound socket name (abstract UDS) or ``None``."""
         return self._addr
 
     @property
@@ -297,7 +294,7 @@ class SidecarManager:
         Returns
         -------
         str
-            The bound address (``"host:port"``).
+            The bound socket name (abstract UDS).
 
         Raises
         ------
@@ -396,8 +393,8 @@ class SidecarManager:
         Returns
         -------
         str
-            The new bound address (should match the old one if the port
-            was successfully reused).
+            The new bound socket name (should match the old one if the
+            name was successfully reused).
         """
         was_auto = self.auto_restart
         self.auto_restart = False  # prevent monitor from interfering
@@ -406,6 +403,34 @@ class SidecarManager:
         return await self.start()
 
     # ── health checks ─────────────────────────────────────────────────────
+
+    async def close_session(self, session_id: str, timeout: float = 5.0) -> bool:
+        """Tell the sidecar to drop a logical session's TLS ticket caches.
+
+        Sent best-effort when a ``SessionProxy`` stops, so a finished
+        session's resumption tickets are discarded promptly rather than
+        only aging out of the sidecar's bounded LRU.  Returns ``True`` on a
+        clean ``OK``; failures are non-fatal (the LRU reclaims the scope
+        eventually regardless).
+        """
+        if not self._addr or not session_id:
+            return False
+        try:
+            reader, writer = await self._connect(timeout)
+            try:
+                writer.write(f"CLOSESESSION sid={session_id}\n".encode("ascii"))
+                await writer.drain()
+                resp = await asyncio.wait_for(reader.readline(), timeout=timeout)
+                return resp.strip() == b"OK"
+            finally:
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.debug("Sidecar close_session(%s) failed: %s", session_id, e)
+            return False
 
     async def ping(self, timeout: float = 5.0) -> bool:
         """Send ``PING`` to the sidecar, expect ``PONG``.
@@ -474,7 +499,7 @@ class SidecarManager:
     def _build_args(self) -> list[str]:
         """Build the CLI argument list for the sidecar binary.
 
-        On restart, reuses ``_bound_port`` so the address stays stable
+        On restart, reuses ``_bound_name`` so the socket name stays stable
         and existing ``SessionProxy`` instances keep working without
         reconfiguration.
         """
@@ -636,12 +661,13 @@ class SidecarManager:
     async def _monitor_loop(self) -> None:
         """Background task: detect sidecar crashes and auto-restart.
 
-        Polls every 5 seconds.  On crash detection:
+        Blocks on ``process.wait()`` rather than polling, so it wakes
+        only when the sidecar actually exits.  On crash detection:
 
         1. Sets ``_addr = None`` so SessionProxy connections fail fast.
         2. Checks the restart budget (``max_restarts``).
         3. Waits ``restart_delay`` seconds.
-        4. Spawns a new process on the same port.
+        4. Spawns a new process on the same socket name.
 
         If the restart also fails (e.g. port conflict), the error is
         logged and the loop retries.

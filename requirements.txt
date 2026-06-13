@@ -4,3 +4,4 @@ cryptography
 h2
 uvloop
 brotli
+zstandard

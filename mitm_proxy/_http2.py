@@ -39,6 +39,7 @@ from hyperframe.exceptions import UnknownFrameError as _HF_UnknownFrameError
 from ._common import logger, ProxyConfig, DEFAULT_CONFIG
 from ._interceptor import _ResponseCapture
 from ._io import ManagedConnection
+from ._policy import RequestHeaders, ResponseHeaders
 
 if TYPE_CHECKING:
     from .session import SessionProxy
@@ -89,19 +90,23 @@ _H2_UNSET_CONCURRENT_STREAMS_THRESHOLD = 1 << 31
 _DEFAULT_MAX_CONCURRENT_STREAMS = 100
 
 
-def _decode_header(value: object) -> str:
-    """Normalise an h2 header name/value to ``str``.
+def _b2(value: object) -> bytes:
+    """Coerce an h2 header name/value to ``bytes`` (latin1 for str).
 
-    h2 yields header names and values as ``bytes`` on the wire, but a
-    custom policy's ``filter_response_headers`` may hand back either
-    ``bytes`` or ``str``.  Routing both the request-header build and the
-    response-capture bookkeeping through this helper keeps a single
-    convention — capture state is always ``str`` — instead of one call
-    site trusting bytes and another defending against str.
+    h2 yields bytes on the wire, but a policy could hand back str; this
+    keeps the Headers views uniformly byte-backed without assuming type.
     """
     if isinstance(value, bytes):
-        return value.decode("utf-8", errors="replace")
-    return value  # type: ignore[return-value]
+        return value
+    return value.encode("latin1")  # type: ignore[union-attr]
+
+
+# Connection-level headers HTTP/2 forbids in a HEADERS frame (RFC 9113
+# §8.2.2).  Enforced by the handler at serialise time — a framing rule, not
+# policy hygiene.  Bytes, since h2 header names are bytes on the wire.
+_H2_FORBIDDEN: frozenset[bytes] = frozenset(
+    {b"connection", b"keep-alive", b"proxy-connection", b"transfer-encoding", b"upgrade"}
+)
 
 
 class _Direction:
@@ -177,6 +182,13 @@ class Http2Stream:
         # stream, owned by _StreamReaper.  None when no timer is armed
         # (before arm(), after a reap, or after disarm()).
         "_reap_handle",
+        # Set to True when this stream's RequestReceived had inline PRIORITY
+        # (event.priority_updated was not None) and we already forwarded it
+        # via send_headers with priority params.  Cleared immediately when the
+        # subsequent PriorityUpdated event for the same stream fires, so that
+        # prioritize() is NOT called — preventing a redundant standalone PRIORITY
+        # frame that corrupts the Akamai H2 fingerprint.
+        "_had_inline_priority",
     )
 
     def __init__(
@@ -207,6 +219,7 @@ class Http2Stream:
         self.to_target = _Direction()
         self.to_client = _Direction()
         self._reap_handle: Optional[asyncio.TimerHandle] = None
+        self._had_inline_priority: bool = False
 
 
 # ============================================================================
@@ -1296,35 +1309,43 @@ class Http2Handler:
             reads_total += 1
             bytes_total += len(data)
 
-            # Single parse per buffer, used for both the chatty TRACE
-            # log and the recent_frames ring buffer.  State threaded
-            # through across reads so frame boundaries stay correct.
-            try:
-                summary, pending_body, header_fragment = (
-                    self._summarize_h2_frames(
-                        data,
-                        prior_body_remaining=pending_body,
-                        prior_header_fragment=header_fragment,
-                        max_frames=8,
-                    )
-                )
-            except Exception:
-                # Frame parsing failed — don't let diagnostics crash
-                # the pump loop.  Reset state so we don't compound the
-                # error on the next read.
-                summary = "<summarizer error>"
-                pending_body = 0
-                header_fragment = b""
-
+            # Frame summarization is DIAGNOSTICS ONLY, so keep it off the
+            # hot path.  Previously _summarize_h2_frames ran on every read
+            # regardless of log level (only the trace() call below was
+            # gated), so a bulk download paid a full hyperframe header parse
+            # + string build + ring-buffer maintenance on every buffer for
+            # output nobody was looking at.  Now we only summarize when
+            # TRACE is enabled.  The cross-read carry state (pending_body /
+            # header_fragment) is only meaningful for the rolling trace
+            # history, so it too lives under this guard; when TRACE is off
+            # the ProtocolError handler below summarizes the single failing
+            # buffer on the spot, which is the part actually worth seeing.
             if logger.isEnabledFor(5):
+                try:
+                    summary, pending_body, header_fragment = (
+                        self._summarize_h2_frames(
+                            data,
+                            prior_body_remaining=pending_body,
+                            prior_header_fragment=header_fragment,
+                            max_frames=8,
+                        )
+                    )
+                except Exception:
+                    # Frame parsing failed — don't let diagnostics crash
+                    # the pump loop.  Reset state so we don't compound the
+                    # error on the next read.
+                    summary = "<summarizer error>"
+                    pending_body = 0
+                    header_fragment = b""
+
                 logger.trace(
                     "[HTTP/2 %s sid=%s] %d bytes received: %s",
                     side, sid, len(data), summary,
                 )
 
-            recent_frames.append(summary)
-            if len(recent_frames) > max_recent:
-                del recent_frames[0]
+                recent_frames.append(summary)
+                if len(recent_frames) > max_recent:
+                    del recent_frames[0]
 
             # If the state machine is already CLOSED, feeding more data
             # into receive_data() is just going to produce ProtocolError
@@ -1358,22 +1379,32 @@ class Http2Handler:
                 #   - which side/session
                 #   - h2's connection state right before the failure
                 #   - the failing buffer's frame summary
-                #   - the recent-frames history so we can see the
-                #     conversation leading up to the error
+                #   - the recent-frames history (only populated when TRACE
+                #     is on; empty otherwise)
+                # We summarize the failing buffer HERE, lazily, so the hot
+                # path pays nothing when there's no error.  When TRACE was
+                # off there's no rolling history, but the failing buffer is
+                # the most actionable part and we still get it.
                 conn_state = "?"
                 try:
                     conn_state = h2_in.state_machine.state.name
                 except Exception:
                     pass
+                try:
+                    failing_summary, _, _ = self._summarize_h2_frames(
+                        data, max_frames=8,
+                    )
+                except Exception:
+                    failing_summary = "<summarizer error>"
                 logger.warning(
                     "[HTTP/2 %s sid=%s] ProtocolError: %s\n"
                     "  conn_state_before=%s\n"
                     "  failing_buffer=%s\n"
-                    "  recent_frames (oldest first):\n    %s",
+                    "  recent_frames (oldest first, TRACE only):\n    %s",
                     side, sid, e,
                     conn_state,
-                    summary,
-                    "\n    ".join(recent_frames) or "(none)",
+                    failing_summary,
+                    "\n    ".join(recent_frames) or "(none — enable TRACE for history)",
                 )
                 exit_reason = "protocol_error"
                 break
@@ -1505,8 +1536,9 @@ class Http2Handler:
             wpos += len(magic)
 
         # 4. Parse complete frame headers; advance past their bodies.
+        mv = memoryview(work)
         while wpos + 9 <= len(work):
-            header = memoryview(work)[wpos:wpos + 9]
+            header = mv[wpos:wpos + 9]
             try:
                 frame, body_len = _HF_Frame.parse_frame_header(header)
             except _HF_UnknownFrameError as e:
@@ -1526,7 +1558,7 @@ class Http2Handler:
 
             if len(out) < max_frames:
                 ftype = type(frame).__name__.replace("Frame", "").upper() or "?"
-                flagstr = ",".join(frame.flags) or "-"
+                flagstr = ",".join(sorted(frame.flags)) or "-"
                 out.append(f"{ftype} s={frame.stream_id} f={flagstr} len={body_len}")
             else:
                 truncated += 1
@@ -1998,20 +2030,18 @@ class Http2Handler:
                 )
                 return
 
-            # h2's RequestReceived.headers is typed as list[tuple[bytes, bytes]],
-            # but a policy could conceivably hand back str; route through
-            # _decode_header so this path uses the same normalisation as the
-            # response side instead of assuming bytes.
-            headers: list[tuple[str, str]] = [
-                (_decode_header(k), _decode_header(v))
-                for k, v in event.headers
-            ]
+            # Build the protocol-agnostic request view straight from the
+            # wire pairs (h2 already carries the four pseudo-headers in the
+            # block; the view splits them into typed fields).  bytes in,
+            # bytes out — no str round-trip.
+            view = RequestHeaders(
+                [(_b2(k), _b2(v)) for k, v in event.headers]
+            )
 
-            headers_lookup = {k.lower(): v for k, v in headers}
-            path = headers_lookup.get(":path", "/")
-            authority = headers_lookup.get(":authority", target_host)
-            scheme = headers_lookup.get(":scheme", "https")
-            method = headers_lookup.get(":method")
+            path = view.path or "/"
+            authority = view.authority or target_host
+            scheme = view.scheme or "https"
+            method = view.method
 
             if not method:
                 client_h2.reset_stream(
@@ -2029,9 +2059,15 @@ class Http2Handler:
                 socks or "direct",
                 client_stream_id,
             )
-            modified = self._proxy.policy.transform_request_headers(
-                url, headers, is_h2=True
-            )
+            view = self._proxy.policy.transform_request_headers(url, view)
+            # HTTP/2 forbids connection-level headers in a HEADERS frame
+            # (RFC 9113 §8.2.2).  This is a framing rule the h2 handler owns
+            # — not policy hygiene — so we enforce it here on the way to the
+            # wire, dropping any the client sent or a policy added.
+            modified = [
+                (k, v) for k, v in view.to_pairs()
+                if k.lower() not in _H2_FORBIDDEN
+            ]
 
             target_stream_id = target_h2.get_next_available_stream_id()
             stream = Http2Stream(
@@ -2051,7 +2087,30 @@ class Http2Handler:
                 captures[client_stream_id] = capture
 
             end_stream = event.stream_ended is not None
-            target_h2.send_headers(target_stream_id, modified, end_stream=end_stream)
+
+            # Preserve Chrome's inline PRIORITY from the HEADERS frame.
+            #
+            # When a HEADERS frame carries the PRIORITY flag (0x20), h2 embeds
+            # the priority in event.priority_updated AND appends a standalone
+            # PriorityUpdated to the same events list.  We pass the inline
+            # priority to send_headers so the PRIORITY flag appears on the
+            # outgoing HEADERS frame — matching Chrome's wire format exactly.
+            #
+            # We also set _had_inline_priority so the subsequent PriorityUpdated
+            # handler skips calling prioritize(), which would emit a redundant
+            # standalone PRIORITY frame.  That extra frame shifts the Akamai
+            # fingerprint from the correct |0|m,a,s,p to the broken |m,a,s,p1:220.
+            pu = event.priority_updated
+            if pu is not None:
+                stream._had_inline_priority = True
+            target_h2.send_headers(
+                target_stream_id,
+                modified,
+                end_stream=end_stream,
+                priority_weight=pu.weight if pu is not None else None,
+                priority_depends_on=pu.depends_on if pu is not None else None,
+                priority_exclusive=pu.exclusive if pu is not None else None,
+            )
 
         elif isinstance(event, h2.events.DataReceived):
             stream = streams.get_by_client(event.stream_id)
@@ -2111,31 +2170,58 @@ class Http2Handler:
             )
 
         elif isinstance(event, h2.events.PriorityUpdated):
-            # Browser sent a PRIORITY frame (or HEADERS with priority
-            # info).  RFC 9113 §5.3.1 deprecates HTTP/2 priority in
-            # favour of the Priority header — most modern servers ignore
-            # PRIORITY frames — but forwarding preserves the wire-level
-            # fingerprint Chrome presents to the origin.
+            # Browser sent a standalone PRIORITY frame.
+            #
+            # Note: inline PRIORITY from a HEADERS frame is handled above
+            # via event.priority_updated on RequestReceived, NOT here.
+            # h2 only fires PriorityUpdated as a top-level event for
+            # standalone PRIORITY frames.
+            #
+            # RFC 9113 §5.3.1 deprecates HTTP/2 priority in favour of the
+            # Priority header — most modern servers ignore PRIORITY frames —
+            # but forwarding preserves the wire-level fingerprint Chrome
+            # presents to the origin.
             #
             # h2 emits PriorityUpdated for stream_id 0 in some edge
             # cases; only forward when there is a known stream.
+            #
+            # depends_on carries a *client-side* stream ID.  Remap it to
+            # the corresponding target-side stream ID before forwarding;
+            # 0 means "no dependency" and passes through as-is.
             stream = streams.get_by_client(event.stream_id) if event.stream_id else None
             if stream:
-                try:
-                    target_h2.prioritize(
-                        stream_id=stream.target_stream_id,
-                        weight=event.weight,
-                        depends_on=event.depends_on,
-                        exclusive=event.exclusive,
-                    )
-                except (h2.exceptions.ProtocolError, ValueError) as e:
-                    # prioritize() rejects self-dependency and other
-                    # malformed inputs; drop the frame rather than
-                    # tearing down the stream — PRIORITY is advisory.
-                    logger.trace(
-                        "PRIORITY forward dropped (client=%d, target=%d): %s",
-                        event.stream_id, stream.target_stream_id, e,
-                    )
+                # If this PriorityUpdated came from a HEADERS frame with
+                # inline PRIORITY (h2 appends it to the events list even
+                # when priority was already embedded in the HEADERS frame),
+                # the priority was already sent inline via send_headers above.
+                # Calling prioritize() here would emit a redundant standalone
+                # PRIORITY frame, corrupting the Akamai H2 fingerprint by
+                # adding a spurious |stream:weight| suffix after the header
+                # order (e.g. |m,a,s,p1:220 instead of |0|m,a,s,p).
+                if stream._had_inline_priority:
+                    stream._had_inline_priority = False
+                else:
+                    raw_dep = event.depends_on or 0
+                    if raw_dep != 0:
+                        dep_stream = streams.get_by_client(raw_dep)
+                        target_dep = dep_stream.target_stream_id if dep_stream else 0
+                    else:
+                        target_dep = 0
+                    try:
+                        target_h2.prioritize(
+                            stream_id=stream.target_stream_id,
+                            weight=event.weight,
+                            depends_on=target_dep,
+                            exclusive=event.exclusive,
+                        )
+                    except (h2.exceptions.ProtocolError, ValueError) as e:
+                        # prioritize() rejects self-dependency and other
+                        # malformed inputs; drop the frame rather than
+                        # tearing down the stream — PRIORITY is advisory.
+                        logger.trace(
+                            "PRIORITY forward dropped (client=%d, target=%d): %s",
+                            event.stream_id, stream.target_stream_id, e,
+                        )
 
         elif isinstance(event, h2.events.RemoteSettingsChanged):
             # Browser changed its SETTINGS mid-session (rare but legal
@@ -2182,10 +2268,11 @@ class Http2Handler:
             # advertise ENABLE_PUSH=0.  Defensive RST in case some
             # browser sends it anyway.
             try:
-                client_h2.reset_stream(
-                    event.pushed_stream_id,
-                    error_code=h2.errors.ErrorCodes.REFUSED_STREAM,
-                )
+                if event.pushed_stream_id is not None:
+                    client_h2.reset_stream(
+                        event.pushed_stream_id,
+                        error_code=h2.errors.ErrorCodes.REFUSED_STREAM,
+                    )
             except Exception as e:
                 logger.trace("RST of unexpected client push failed: %s", e)
 
@@ -2248,15 +2335,15 @@ class Http2Handler:
             if stream:
                 stream.last_activity = time.monotonic()
                 # send_headers without end_stream — the final response
-                # follows on the same stream.  ``filter_response_headers``
-                # is applied so policy (e.g. Alt-Svc stripping) runs
+                # follows on the same stream.  Routed through the same
+                # ``transform_response`` hook so policy (Alt-Svc stripping,
+                # and any header rule the user targeted at this URL) runs
                 # uniformly on 1xx and 2xx alike.
-                filtered = self._proxy.policy.filter_response_headers(
-                    event.headers
-                )
+                hdrs = ResponseHeaders([(_b2(k), _b2(v)) for k, v in event.headers])
+                hdrs = self._proxy.policy.transform_response_headers(stream.url, hdrs)
                 try:
                     client_h2.send_headers(
-                        stream.client_stream_id, filtered, end_stream=False,
+                        stream.client_stream_id, hdrs.to_pairs(), end_stream=False,
                     )
                 except h2.exceptions.ProtocolError as e:
                     # h2 will reject a 1xx if state doesn't allow it
@@ -2271,31 +2358,28 @@ class Http2Handler:
             stream = streams.get_by_target(event.stream_id)
             if stream:
                 stream.last_activity = time.monotonic()
-                # Policy-driven response header transformation
-                # (default: strips h3 from Alt-Svc).
-                filtered_headers = self._proxy.policy.filter_response_headers(
-                    event.headers
-                )
-                client_h2.send_headers(
-                    stream.client_stream_id,
-                    filtered_headers,
-                    end_stream=event.stream_ended is not None,
-                )
+                # Policy hook: hygiene (h3 Alt-Svc strip) plus any matching
+                # response header rule.  ``ResponseHeaders`` exposes the
+                # status as the typed ``.status`` field; on serialise it
+                # re-emits ``:status`` first, native to the h2 block.
+                hdrs = ResponseHeaders([(_b2(k), _b2(v)) for k, v in event.headers])
+                # Record the ORIGINAL wire response for capture BEFORE the
+                # policy transform runs, so an interceptor sees the unmodified
+                # upstream response rather than the browser-facing version.
+                # extend() copies the (immutable) byte-pair tuples into the
+                # capture's own list, so the in-place transform below can't
+                # reach back into it.
                 capture = captures.get(stream.client_stream_id)
                 if capture:
-                    for k, v in filtered_headers:
-                        key = _decode_header(k)
-                        val = _decode_header(v)
-                        if key == ":status":
-                            try:
-                                capture.status_code = int(val)
-                            except ValueError:
-                                logger.debug(
-                                    "Malformed h2 :status %r", val,
-                                )
-                                capture.status_code = 0
-                        else:
-                            capture.headers.append((key, val))
+                    if hdrs.status is not None:
+                        capture.status_code = hdrs.status
+                    capture.headers.extend(hdrs.items())
+                hdrs = self._proxy.policy.transform_response_headers(stream.url, hdrs)
+                client_h2.send_headers(
+                    stream.client_stream_id,
+                    hdrs.to_pairs(),
+                    end_stream=event.stream_ended is not None,
+                )
 
         elif isinstance(event, h2.events.DataReceived):
             stream = streams.get_by_target(event.stream_id)
@@ -2461,10 +2545,11 @@ class Http2Handler:
             # the browser is also seeing ENABLE_PUSH=0 in our mirrored
             # settings, so it wouldn't accept the push anyway.
             try:
-                target_h2.reset_stream(
-                    event.pushed_stream_id,
-                    error_code=h2.errors.ErrorCodes.REFUSED_STREAM,
-                )
+                if event.pushed_stream_id is not None:
+                    target_h2.reset_stream(
+                        event.pushed_stream_id,
+                        error_code=h2.errors.ErrorCodes.REFUSED_STREAM,
+                    )
             except Exception as e:
                 logger.trace(
                     "RST of unwanted target push failed (pushed=%d): %s",

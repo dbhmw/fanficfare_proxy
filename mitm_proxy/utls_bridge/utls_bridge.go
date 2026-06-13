@@ -16,12 +16,20 @@
 // The Python proxy connects to this sidecar over a local TCP socket.
 // Each connection carries exactly one command:
 //
-//	CONNECT host:port [socks5://proxy:port]\n
+//	CONNECT host:port [socks5://proxy:port] [sid=<hex>]\n
 //	  → OK <negotiated-alpn>\n   (success — bidirectional pipe follows)
 //	  → ERR <message>\n          (failure — connection closed)
 //
-//	PING\n   → PONG\n            (health check)
-//	STATS\n  → {"active_conns":...}\n  (JSON metrics)
+//	PING\n               → PONG\n   (health check)
+//	STATS\n              → {"active_conns":...}\n  (JSON metrics)
+//	CLOSESESSION sid=<hex>\n → OK\n (drop a session's TLS ticket caches)
+//
+// The optional CONNECT tokens are order-independent: "sid=" is labelled,
+// the proxy URL is positional.  "sid" identifies the logical proxy
+// session and scopes TLS session-ticket resumption to "<sid>|<exit>", so
+// a session resumes its own tickets to a host over the same SOCKS exit
+// (as a real Chrome would) but never resumes across sessions or exits.
+// A CONNECT without "sid=" does a fresh full handshake (no resumption).
 //
 // After a successful CONNECT, the sidecar holds the TLS session open
 // and pipes plaintext bytes between the Python proxy and the encrypted
@@ -51,6 +59,7 @@ package main
 
 import (
 	"bufio"
+	"container/list"
 	"context"
 	"encoding/binary"
 	"encoding/json"
@@ -92,7 +101,99 @@ type Config struct {
 	PipeWriteTimeout	time.Duration
 }
 
-var sessionCache = tls.NewLRUClientSessionCache(256)
+// Per-session TLS session-ticket caching.
+//
+// A single sidecar process is shared across every SessionProxy and every
+// SOCKS exit, and a crypto/tls ClientSessionCache is keyed only by
+// ServerName.  One *shared* cache would let a connection resume a ticket
+// that was established over a different logical session or a different
+// SOCKS exit IP — which (a) links otherwise-independent sessions and
+// (b) is itself anomalous (a ticket replayed from a new source IP).
+//
+// But disabling resumption entirely is *also* a fingerprint signal: a real
+// Chrome resumes sessions to hosts it has already seen, so a client that
+// always does a full handshake stands out to advanced fingerprinting.
+//
+// The fix is scoped caches: each logical proxy session gets its own cache,
+// further scoped by SOCKS exit, so resumption happens within "same session
+// + same exit" (realistic) and never crosses a session or an exit
+// boundary (isolation).  The scope key is "<sessionID>|<exit>"; the Python
+// side sends the session id as a "sid=" token on the CONNECT command, and
+// drops the whole session's caches via CLOSESESSION when the proxy stops.
+//
+// Memory is bounded two ways: each scope's cache is an LRU of at most
+// perSessionTickets tickets, and the number of live scopes is itself an
+// LRU capped at maxSessionScopes (the least-recently-used scope is evicted,
+// after which connections in that scope simply fall back to a full
+// handshake).  This keeps a large, churning proxy pool from growing caches
+// without limit.
+const (
+	maxSessionScopes  = 256 // distinct (session,exit) scopes kept at once
+	perSessionTickets = 32  // resumption tickets retained per scope
+)
+
+type cacheEntry struct {
+	key   string
+	cache tls.ClientSessionCache
+}
+
+type sessionCacheStore struct {
+	mu      sync.Mutex
+	max     int
+	ll      *list.List               // front = most-recently-used
+	entries map[string]*list.Element // key -> *list.Element(*cacheEntry)
+}
+
+func newSessionCacheStore(max int) *sessionCacheStore {
+	return &sessionCacheStore{
+		max:     max,
+		ll:      list.New(),
+		entries: make(map[string]*list.Element),
+	}
+}
+
+// get returns the cache for a scope key, creating it on first use and
+// evicting the least-recently-used scope if over capacity.
+func (s *sessionCacheStore) get(key string) tls.ClientSessionCache {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if el, ok := s.entries[key]; ok {
+		s.ll.MoveToFront(el)
+		return el.Value.(*cacheEntry).cache
+	}
+
+	c := tls.NewLRUClientSessionCache(perSessionTickets)
+	el := s.ll.PushFront(&cacheEntry{key: key, cache: c})
+	s.entries[key] = el
+
+	for s.ll.Len() > s.max {
+		back := s.ll.Back()
+		if back == nil {
+			break
+		}
+		s.ll.Remove(back)
+		delete(s.entries, back.Value.(*cacheEntry).key)
+	}
+	return c
+}
+
+// dropSession evicts every scope belonging to a session (across all exits),
+// so a finished session's resumption tickets don't linger.  Best-effort:
+// scopes also age out via the LRU if CLOSESESSION never arrives.
+func (s *sessionCacheStore) dropSession(sessionID string) {
+	prefix := sessionID + "|"
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for k, el := range s.entries {
+		if strings.HasPrefix(k, prefix) {
+			s.ll.Remove(el)
+			delete(s.entries, k)
+		}
+	}
+}
+
+var sessionCaches = newSessionCacheStore(maxSessionScopes)
 
 // ---------------------------------------------------------------------------
 // Buffer pool — avoids per-connection heap allocation under load
@@ -229,7 +330,8 @@ func logf(level, format string, args ...any) {
 // The context deadline is respected for both the proxy connection and
 // the SOCKS5 handshake.  On success the returned net.Conn is ready for
 // application-level I/O (TLS handshake in our case).
-func dialSOCKS5(ctx context.Context, proxyAddr, targetHost string, targetPort int) (net.Conn, error) {
+func dialSOCKS5(ctx context.Context, p socks5Proxy, targetHost string, targetPort int) (net.Conn, error) {
+	proxyAddr := p.addr
 	// SOCKS5 uses a single byte for domain length — enforce the limit
 	// early so we get a clear error instead of a truncated domain.
 	if len(targetHost) > 255 {
@@ -259,8 +361,18 @@ func dialSOCKS5(ctx context.Context, proxyAddr, targetHost string, targetPort in
 		conn.SetDeadline(deadline)
 	}
 
-	// --- Greeting: offer "no auth" (method 0x00) ---
-	if _, err := conn.Write([]byte{0x05, 0x01, 0x00}); err != nil {
+	// --- Greeting: method selection (RFC 1928 §3) ---
+	// Offer no-auth always; add user/pass (0x02) when we have credentials.
+	// Byte-for-byte identical to the Python client's greeting:
+	//   creds    -> 05 02 00 02   (NMETHODS=2, methods = no-auth, user/pass)
+	//   no creds -> 05 01 00      (NMETHODS=1, methods = no-auth)
+	var greeting []byte
+	if p.hasAuth {
+		greeting = []byte{0x05, 0x02, 0x00, 0x02}
+	} else {
+		greeting = []byte{0x05, 0x01, 0x00}
+	}
+	if _, err := conn.Write(greeting); err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("socks5 handshake write: %w", err)
 	}
@@ -270,10 +382,55 @@ func dialSOCKS5(ctx context.Context, proxyAddr, targetHost string, targetPort in
 		conn.Close()
 		return nil, fmt.Errorf("socks5 handshake read: %w", err)
 	}
-	if resp[0] != 0x05 || resp[1] == 0xFF {
+	if resp[0] != 0x05 {
 		conn.Close()
-		logf("WARN", "socks5: proxy %s rejected auth method for %s:%d", proxyAddr, targetHost, targetPort)
-		return nil, errors.New("socks5: no acceptable auth method")
+		return nil, fmt.Errorf("socks5: bad version 0x%02x in method selection reply (RFC 1928 §3 requires 0x05)", resp[0])
+	}
+	method := resp[1]
+	switch method {
+	case 0xFF:
+		conn.Close()
+		logf("WARN", "socks5: proxy %s rejected all offered auth methods for %s:%d", proxyAddr, targetHost, targetPort)
+		return nil, errors.New("socks5: server rejected all offered auth methods")
+	case 0x00:
+		if p.hasAuth {
+			logf("DEBUG", "socks5: proxy %s selected no-auth despite credentials being offered", proxyAddr)
+		}
+	case 0x02:
+		if !p.hasAuth {
+			conn.Close()
+			return nil, errors.New("socks5: server selected user/pass auth but no credentials were supplied")
+		}
+		// --- RFC 1929 §2: user/pass sub-negotiation ---
+		// VER=0x01, ULEN, uname, PLEN, passwd.
+		uname := []byte(p.username)
+		passwd := []byte(p.password)
+		authPkt := make([]byte, 0, 3+len(uname)+len(passwd))
+		authPkt = append(authPkt, 0x01, byte(len(uname)))
+		authPkt = append(authPkt, uname...)
+		authPkt = append(authPkt, byte(len(passwd)))
+		authPkt = append(authPkt, passwd...)
+		if _, err := conn.Write(authPkt); err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("socks5 auth write: %w", err)
+		}
+		authResp := make([]byte, 2)
+		if _, err := io.ReadFull(conn, authResp); err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("socks5 auth read: %w", err)
+		}
+		if authResp[0] != 0x01 {
+			conn.Close()
+			return nil, fmt.Errorf("socks5 auth: bad sub-negotiation version 0x%02x (RFC 1929 §2 requires 0x01)", authResp[0])
+		}
+		if authResp[1] != 0x00 {
+			conn.Close()
+			logf("WARN", "socks5: proxy %s rejected credentials (status=0x%02x)", proxyAddr, authResp[1])
+			return nil, fmt.Errorf("socks5 auth: server rejected credentials (status 0x%02x)", authResp[1])
+		}
+	default:
+		conn.Close()
+		return nil, fmt.Errorf("socks5: server selected unsupported method 0x%02x", method)
 	}
 
 	// --- CONNECT request: domain-name address type (0x03) ---
@@ -295,6 +452,16 @@ func dialSOCKS5(ctx context.Context, proxyAddr, targetHost string, targetPort in
 	if _, err := io.ReadFull(conn, respHdr); err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("socks5 connect read: %w", err)
+	}
+	// Validation order matches the Python client: version, then RSV, then
+	// the REP error code.
+	if respHdr[0] != 0x05 {
+		conn.Close()
+		return nil, fmt.Errorf("socks5: bad version 0x%02x in CONNECT reply (RFC 1928 §6 requires 0x05)", respHdr[0])
+	}
+	if respHdr[2] != 0x00 {
+		conn.Close()
+		return nil, fmt.Errorf("socks5: non-zero RSV byte 0x%02x in CONNECT reply (RFC 1928 §6 requires 0x00)", respHdr[2])
 	}
 	if respHdr[1] != 0x00 {
 		conn.Close()
@@ -323,17 +490,17 @@ func dialSOCKS5(ctx context.Context, proxyAddr, targetHost string, targetPort in
 	// need but must read to leave the stream in a clean state.
 	var drainErr error
 	switch respHdr[3] {
-		case 0x01: // IPv4 (4 bytes) + port (2 bytes)
-			_, drainErr = io.ReadFull(conn, make([]byte, 6))
-		case 0x03: // Domain: 1-byte length + domain + 2-byte port
-			lenBuf := make([]byte, 1)
-			if _, drainErr = io.ReadFull(conn, lenBuf); drainErr == nil {
-				_, drainErr = io.ReadFull(conn, make([]byte, int(lenBuf[0])+2))
-			}
-		case 0x04: // IPv6 (16 bytes) + port (2 bytes)
-			_, drainErr = io.ReadFull(conn, make([]byte, 18))
-		default:
-			drainErr = fmt.Errorf("unknown address type 0x%02x", respHdr[3])
+	case 0x01: // IPv4 (4 bytes) + port (2 bytes)
+		_, drainErr = io.ReadFull(conn, make([]byte, 6))
+	case 0x03: // Domain: 1-byte length + domain + 2-byte port
+		lenBuf := make([]byte, 1)
+		if _, drainErr = io.ReadFull(conn, lenBuf); drainErr == nil {
+			_, drainErr = io.ReadFull(conn, make([]byte, int(lenBuf[0])+2))
+		}
+	case 0x04: // IPv6 (16 bytes) + port (2 bytes)
+		_, drainErr = io.ReadFull(conn, make([]byte, 18))
+	default:
+		drainErr = fmt.Errorf("unknown address type 0x%02x", respHdr[3])
 	}
 	if drainErr != nil {
 		conn.Close()
@@ -352,6 +519,39 @@ func dialSOCKS5(ctx context.Context, proxyAddr, targetHost string, targetPort in
 // Chrome TLS handshake
 // ---------------------------------------------------------------------------
 
+// chromeClientHelloSpec returns a fresh Chrome ClientHelloSpec
+// (HelloChrome_Auto — the latest stable Chrome this utls build knows) with a
+// real pre_shared_key extension appended last, so the fingerprint can carry a
+// resumption PSK.
+//
+// Why not just hand HelloChrome_Auto to UClient?  Because that preset cannot
+// resume: its extension list contains no pre_shared_key, so utls never offers
+// a cached ticket and every connection is a full handshake — exactly the
+// "always fresh" signal we want to avoid.  utls *does* ship resumption-capable
+// presets, but only for older Chrome (the newest is Chrome 115); using one
+// would make the TLS fingerprint disagree with the Chrome-133 User-Agent the
+// proxy presents to the browser, which is a worse tell than not resuming.
+//
+// So we keep the exact current-Chrome fingerprint and append the PSK
+// extension ourselves.  The base spec already includes psk_key_exchange_modes,
+// and pre_shared_key must be the final extension, so appending it is correct.
+// Combined with Config.OmitEmptyPsk, the extension is dropped when no ticket
+// is cached (a first hello then looks like a real Chrome first hello) and
+// included on resumption (matching a real resumed hello).
+//
+// A fresh spec is built per call: ApplyPreset binds per-connection state onto
+// the extension objects, so specs must not be shared between handshakes.
+func chromeClientHelloSpec() (tls.ClientHelloSpec, error) {
+	spec, err := tls.UTLSIdToSpec(tls.HelloChrome_Auto)
+	if err != nil {
+		return spec, err
+	}
+	spec.Extensions = append(spec.Extensions, &tls.UtlsPreSharedKeyExtension{})
+	return spec, nil
+}
+
+// ---------------------------------------------------------------------------
+
 // chromeHandshake wraps an existing TCP connection in a utls.UConn
 // configured to replicate Chrome's ClientHello byte-for-byte.
 //
@@ -367,13 +567,37 @@ func dialSOCKS5(ctx context.Context, proxyAddr, targetHost string, targetPort in
 // Returns the utls connection, the negotiated ALPN string, and any
 // error.  On error the connection is closed and the caller must NOT
 // close it again (utls.UConn.Close releases internal state).
-func chromeHandshake(ctx context.Context, conn net.Conn, hostname string, insecure bool) (*tls.UConn, string, error) {
+func chromeHandshake(ctx context.Context, conn net.Conn, hostname string, insecure bool, cache tls.ClientSessionCache) (*tls.UConn, string, error) {
 	logf("DEBUG", "tls: starting Chrome handshake with %s", hostname)
 	uconn := tls.UClient(conn, &tls.Config{
 		ServerName:         hostname,
 		InsecureSkipVerify: insecure,
-		ClientSessionCache: sessionCache,
-	}, tls.HelloChrome_Auto)
+		// Per-session/exit cache (may be nil — e.g. a client that sends no
+		// sid — in which case no ticket is stored or offered and this is a
+		// fresh full handshake).  Scoping is enforced by the caller via the
+		// scope key; see sessionCacheStore.
+		ClientSessionCache: cache,
+		// Omit the appended pre_shared_key extension when there is no cached
+		// ticket to offer, instead of erroring on the empty PSK.  This makes
+		// a first (or no-sid) hello match a real Chrome first hello, while a
+		// resuming hello carries the PSK — see chromeClientHelloSpec.
+		OmitEmptyPsk: true,
+	}, tls.HelloCustom)
+
+	// Apply the Chrome fingerprint as an explicit spec with a real PSK
+	// extension appended, rather than the bare HelloChrome_Auto preset —
+	// the preset cannot resume (see chromeClientHelloSpec for why).  A fresh
+	// spec is built per handshake because ApplyPreset binds per-connection
+	// state onto the extension objects.
+	spec, err := chromeClientHelloSpec()
+	if err != nil {
+		conn.Close()
+		return nil, "", fmt.Errorf("build chrome spec %s: %w", hostname, err)
+	}
+	if err := uconn.ApplyPreset(&spec); err != nil {
+		conn.Close()
+		return nil, "", fmt.Errorf("apply chrome spec %s: %w", hostname, err)
+	}
 
 	if deadline, ok := ctx.Deadline(); ok {
 		uconn.SetDeadline(deadline)
@@ -453,6 +677,22 @@ func handleConn(conn net.Conn, cfg Config) {
 			writeResp(conn, cfg, string(data)+"\n")
 			conn.Close()
 
+		case "CLOSESESSION":
+			// CLOSESESSION sid=<hex> — drop a finished session's cached
+			// resumption tickets (across all exits) so they don't linger.
+			// Control plane; doesn't touch connection counters.
+			var sid string
+			for _, f := range fields[1:] {
+				if strings.HasPrefix(f, "sid=") {
+					sid = strings.TrimPrefix(f, "sid=")
+				}
+			}
+			if sid != "" {
+				sessionCaches.dropSession(sid)
+			}
+			writeResp(conn, cfg, "OK\n")
+			conn.Close()
+
 		case "CONNECT":
 			// Only CONNECT increments metrics — PING/STATS are control
 			// plane and shouldn't inflate the connection counters.
@@ -473,49 +713,97 @@ func handleConn(conn net.Conn, cfg Config) {
 // Returns an error if the port is invalid rather than falling through
 // silently to a default.
 func parseTarget(target string) (host string, port int, err error) {
-    host, portStr, err := net.SplitHostPort(target)
-    if err != nil {
-        // No port — default to 443. Strip brackets for bare IPv6 like "[::1]".
-        host = strings.TrimSuffix(strings.TrimPrefix(target, "["), "]")
-        if host == "" {
-            return "", 0, fmt.Errorf("empty hostname in target %q", target)
-        }
-        return host, 443, nil
-    }
-    if host == "" {
-        return "", 0, fmt.Errorf("empty hostname in target %q", target)
-    }
-    port, err = net.LookupPort("tcp", portStr)
-    if err != nil {
-        return "", 0, fmt.Errorf("invalid port %q: %w", portStr, err)
-    }
-    return host, port, nil
+	host, portStr, err := net.SplitHostPort(target)
+	if err != nil {
+		// No port — default to 443. Strip brackets for bare IPv6 like "[::1]".
+		host = strings.TrimSuffix(strings.TrimPrefix(target, "["), "]")
+		if host == "" {
+			return "", 0, fmt.Errorf("empty hostname in target %q", target)
+		}
+		return host, 443, nil
+	}
+	if host == "" {
+		return "", 0, fmt.Errorf("empty hostname in target %q", target)
+	}
+	port, err = net.LookupPort("tcp", portStr)
+	if err != nil {
+		return "", 0, fmt.Errorf("invalid port %q: %w", portStr, err)
+	}
+	return host, port, nil
 }
 
-// parseSOCKS5Proxy parses a SOCKS5 proxy URL string into a host:port
-// address.  Supports "socks5://host:port" and "socks://host:port".
-// Returns an error for malformed URLs or URLs containing userinfo
-// (authentication is not supported).
-func parseSOCKS5Proxy(raw string) (string, error) {
+// socks5Proxy is a parsed SOCKS5 endpoint.  It mirrors the feature set of
+// the Python Socks5Client: a host:port plus optional RFC 1929
+// username/password credentials.  addr never contains credentials, so it
+// is safe to log; username/password must never be logged.
+type socks5Proxy struct {
+	addr     string // host:port (no credentials)
+	username string
+	password string
+	hasAuth  bool
+}
+
+// redactProxyURL strips any userinfo from a proxy URL so credentials never
+// reach logs or the client-facing ERR response.  Best-effort: it works on
+// both well-formed and partially-malformed URLs by editing the text between
+// "://" and the last "@".
+func redactProxyURL(raw string) string {
+	i := strings.Index(raw, "://")
+	if i < 0 {
+		i = -3 // pretend the scheme delimiter ended at index 0
+	}
+	at := strings.LastIndex(raw, "@")
+	if at > i+3 {
+		return raw[:i+3] + "***@" + raw[at+1:]
+	}
+	return raw
+}
+
+// parseSOCKS5Proxy parses a SOCKS5 proxy URL into a socks5Proxy.
+//
+// Grammar (kept identical to the Python Socks5Client / the future
+// _socks5.py normalizer):
+//
+//	socks5://[user[:pass]@]host:port      (socks5h and socks aliases accepted)
+//
+// url.Parse percent-decodes the userinfo, matching Python's
+// urllib.parse.unquote, so a normalizer that percent-encodes delimiter
+// characters yields byte-identical credentials on both sides.  socks5 and
+// socks5h are treated the same here because the dialer always sends the
+// target as a domain name (ATYP=0x03), i.e. DNS is resolved at the exit
+// regardless of the "h".
+func parseSOCKS5Proxy(raw string) (socks5Proxy, error) {
+	var p socks5Proxy
 	u, err := url.Parse(raw)
 	if err != nil {
-		return "", fmt.Errorf("invalid proxy URL %q: %w", raw, err)
+		return p, fmt.Errorf("invalid proxy URL %q: %w", redactProxyURL(raw), err)
 	}
-	if u.Scheme != "socks5" && u.Scheme != "socks" {
-		return "", fmt.Errorf("unsupported proxy scheme %q (want socks5)", u.Scheme)
-	}
-	if u.User != nil {
-		return "", fmt.Errorf("socks5 authentication not supported")
+	if u.Scheme != "socks5" && u.Scheme != "socks5h" && u.Scheme != "socks" {
+		return p, fmt.Errorf("unsupported proxy scheme %q (want socks5)", u.Scheme)
 	}
 	hostport := u.Host
 	if hostport == "" {
-		return "", fmt.Errorf("proxy URL %q has no host", raw)
+		return p, fmt.Errorf("proxy URL %q has no host", redactProxyURL(raw))
 	}
 	// Ensure we have a port
 	if _, _, err := net.SplitHostPort(hostport); err != nil {
-		return "", fmt.Errorf("proxy URL %q missing port: %w", raw, err)
+		return p, fmt.Errorf("proxy URL %q missing port: %w", redactProxyURL(raw), err)
 	}
-	return hostport, nil
+	p.addr = hostport
+
+	// RFC 1929 credentials, if present.  Username-only ("user@host") is
+	// valid and yields an empty password, matching the Python client.
+	if u.User != nil {
+		p.username = u.User.Username()
+		p.password, _ = u.User.Password()
+		p.hasAuth = true
+		// RFC 1929 §2: ULEN/PLEN are single bytes (max 255); the username
+		// must be non-empty.  Same validation as the Python client.
+		if len(p.username) == 0 || len(p.username) > 255 || len(p.password) > 255 {
+			return p, fmt.Errorf("socks5 username/password must be 1-255 bytes each")
+		}
+	}
+	return p, nil
 }
 
 // doConnect handles the CONNECT command:
@@ -525,88 +813,115 @@ func parseSOCKS5Proxy(raw string) (string, error) {
 //  4. Report negotiated ALPN to the Python side
 //  5. Enter bidirectional plaintext pipe
 func doConnect(conn net.Conn, reader *bufio.Reader, fields []string, cfg Config) {
-    defer func() {
-        if conn != nil {
-            conn.Close()
-        }
-    }()
+	defer func() {
+		if conn != nil {
+			conn.Close()
+		}
+	}()
 
-    if len(fields) < 2 {
-        writeResp(conn, cfg, "ERR CONNECT requires host:port\n")
-        return
-    }
+	if len(fields) < 2 {
+		writeResp(conn, cfg, "ERR CONNECT requires host:port\n")
+		return
+	}
 
-    target := fields[1]
-    host, port, err := parseTarget(target)
-    if err != nil {
-        writeResp(conn, cfg, fmt.Sprintf("ERR %s\n", err))
-        return
-    }
+	target := fields[1]
+	host, port, err := parseTarget(target)
+	if err != nil {
+		writeResp(conn, cfg, fmt.Sprintf("ERR %s\n", err))
+		return
+	}
 
-    var socksProxy string
-    if len(fields) >= 3 {
-        socksProxy, err = parseSOCKS5Proxy(fields[2])
-        if err != nil {
-            writeResp(conn, cfg, fmt.Sprintf("ERR %s\n", err))
-            return
-        }
-    }
+	var socksProxy socks5Proxy
+	var haveProxy bool
+	// Parse optional trailing tokens after the target: a SOCKS5 proxy URL
+	// (positional) and/or a session id ("sid=<hex>", labelled).  Order is
+	// irrelevant, and a client that sends neither still works — so this is
+	// backward compatible with the old "CONNECT host:port [proxy]" form.
+	var rawProxy, sessionID string
+	for _, f := range fields[2:] {
+		if strings.HasPrefix(f, "sid=") {
+			sessionID = strings.TrimPrefix(f, "sid=")
+		} else if rawProxy == "" {
+			rawProxy = f
+		}
+	}
+	if rawProxy != "" {
+		socksProxy, err = parseSOCKS5Proxy(rawProxy)
+		if err != nil {
+			// err is already redacted by parseSOCKS5Proxy.
+			writeResp(conn, cfg, fmt.Sprintf("ERR %s\n", err))
+			return
+		}
+		haveProxy = true
+	}
 
-    ctx, cancel := context.WithTimeout(context.Background(), cfg.ConnectTimeout)
-    defer cancel()
+	ctx, cancel := context.WithTimeout(context.Background(), cfg.ConnectTimeout)
+	defer cancel()
 
-    var targetConn net.Conn
-    if socksProxy != "" {
-        logf("INFO", "connect: %s via socks5://%s", target, socksProxy)
-        targetConn, err = dialSOCKS5(ctx, socksProxy, host, port)
-    } else {
-        logf("INFO", "connect: %s (direct)", target)
-        targetConn, err = (&net.Dialer{}).DialContext(ctx, "tcp",
-            net.JoinHostPort(host, fmt.Sprintf("%d", port)))
-    }
-    if err != nil {
-        logf("WARN", "connect: dial %s failed: %v", target, err)
-        writeResp(conn, cfg, fmt.Sprintf("ERR %s\n", err))
-        return
-    }
+	var targetConn net.Conn
+	if haveProxy {
+		// Log the exit address only — never the credentials.
+		logf("INFO", "connect: %s via socks5 %s (auth=%t)", target, socksProxy.addr, socksProxy.hasAuth)
+		targetConn, err = dialSOCKS5(ctx, socksProxy, host, port)
+	} else {
+		logf("INFO", "connect: %s (direct)", target)
+		targetConn, err = (&net.Dialer{}).DialContext(ctx, "tcp",
+			net.JoinHostPort(host, fmt.Sprintf("%d", port)))
+	}
+	if err != nil {
+		logf("WARN", "connect: dial %s failed: %v", target, err)
+		writeResp(conn, cfg, fmt.Sprintf("ERR %s\n", err))
+		return
+	}
 
-    tlsConn, alpn, err := chromeHandshake(ctx, targetConn, host, cfg.Insecure)
-    if err != nil {
-        logf("WARN", "connect: TLS failed for %s: %v", target, err)
-        writeResp(conn, cfg, fmt.Sprintf("ERR %s\n", err))
-        return  // chromeHandshake already closed targetConn
-    }
-    defer func() {
-        if tlsConn != nil {
-            tlsConn.Close()
-        }
-    }()
+	// Scope TLS session resumption to this logical session + SOCKS exit.
+	// No session id (old client) => nil cache => fresh full handshake.
+	var scopeCache tls.ClientSessionCache
+	if sessionID != "" {
+		exit := "direct"
+		if haveProxy {
+			exit = socksProxy.addr
+		}
+		scopeCache = sessionCaches.get(sessionID + "|" + exit)
+	}
 
-    if err := writeResp(conn, cfg, fmt.Sprintf("OK %s\n", alpn)); err != nil {
-        logf("WARN", "connect: failed to send OK to client for %s: %v", target, err)
-        return
-    }
+	tlsConn, alpn, err := chromeHandshake(ctx, targetConn, host, cfg.Insecure, scopeCache)
+	if err != nil {
+		logf("WARN", "connect: TLS failed for %s: %v", target, err)
+		writeResp(conn, cfg, fmt.Sprintf("ERR %s\n", err))
+		return // chromeHandshake already closed targetConn
+	}
+	defer func() {
+		if tlsConn != nil {
+			tlsConn.Close()
+		}
+	}()
 
-    if reader.Buffered() > 0 {
-        buf := make([]byte, reader.Buffered())
-        n, _ := reader.Read(buf)
-        if n > 0 {
-            logf("DEBUG", "connect: flushing %d buffered bytes to %s", n, target)
-            if _, err := tlsConn.Write(buf[:n]); err != nil {
-                logf("WARN", "connect: flush to %s failed: %v", target, err)
-                return
-            }
-        }
-    }
+	if err := writeResp(conn, cfg, fmt.Sprintf("OK %s\n", alpn)); err != nil {
+		logf("WARN", "connect: failed to send OK to client for %s: %v", target, err)
+		return
+	}
 
-    // Transfer ownership to pipe() — nil out so defers don't close.
-    c, t := conn, tlsConn
-    conn, tlsConn = nil, nil
-    logf("INFO", "connect: pipe started for %s (alpn=%s active=%d)",
-        target, alpn, metrics.ActiveConns.Load())
-    pipe(c, t, cfg)
-    logf("INFO", "connect: pipe closed for %s (active=%d)",
-        target, metrics.ActiveConns.Load()-1)
+	if reader.Buffered() > 0 {
+		buf := make([]byte, reader.Buffered())
+		n, _ := reader.Read(buf)
+		if n > 0 {
+			logf("DEBUG", "connect: flushing %d buffered bytes to %s", n, target)
+			if _, err := tlsConn.Write(buf[:n]); err != nil {
+				logf("WARN", "connect: flush to %s failed: %v", target, err)
+				return
+			}
+		}
+	}
+
+	// Transfer ownership to pipe() — nil out so defers don't close.
+	c, t := conn, tlsConn
+	conn, tlsConn = nil, nil
+	logf("INFO", "connect: pipe started for %s (alpn=%s active=%d)",
+		target, alpn, metrics.ActiveConns.Load())
+	pipe(c, t, cfg)
+	logf("INFO", "connect: pipe closed for %s (active=%d)",
+		target, metrics.ActiveConns.Load()-1)
 }
 
 // writeResp writes a response string to the connection with a write

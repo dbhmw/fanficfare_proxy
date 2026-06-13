@@ -72,7 +72,23 @@ class ManagedConnection:
         self._closed = True
         try:
             transport = self.writer.transport
-            if transport is None or transport.is_closing():
+            if transport is None:
+                return
+            if transport.is_closing():
+                # The transport is already closing — most commonly because
+                # loop.start_tls() tore it down after a failed handshake.
+                # We must still drive wait_closed() here instead of returning
+                # early: on a failed start_tls() the handshake exception is
+                # left on an internal future that is only retrieved as the
+                # close completes.  Skipping wait_closed() leaves it dangling,
+                # which asyncio reports as "Future exception was never
+                # retrieved" (free-threaded 3.14 no longer suppresses that
+                # internally the way earlier versions did).
+                self.writer.close()
+                try:
+                    await asyncio.wait_for(self.writer.wait_closed(), timeout=2.0)
+                except Exception as e:
+                    logger.debug("Connection close (already-closing) error: %s", e)
                 return
             if force:
                 transport.abort()
@@ -397,6 +413,30 @@ class TLSInterceptor:
             ctx.load_cert_chain(self.ca_cert_path, self.ca_key_path)
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
+            # Enable session resumption toward the browser.  Each browser
+            # CONNECT to a new origin triggers a fresh MITM handshake; without
+            # resumption every one is a full handshake (key exchange + cert
+            # parse) on the proxy's event-loop thread, which is the busiest
+            # thread we have.  Resumption lets the browser present a prior
+            # session and skip the expensive asymmetric crypto.
+            #
+            # TLS 1.3: OpenSSL issues NewSessionTickets automatically for a
+            #   server context, so tickets already work once a session id
+            #   context is set.
+            # TLS 1.2: server-side resumption is a no-op UNLESS a session-id
+            #   context is configured, so set one.  It's an opaque tag (max
+            #   32 bytes) scoping the server's session cache; a constant is
+            #   fine here since every cached context presents the same CA
+            #   identity.
+            #
+            # Resumption state lives in the SSLContext, and these contexts are
+            # cached by ALPN tuple (below), so it persists across connections
+            # for the life of the proxy — which is exactly what we want.
+            try:
+                ctx.set_session_id_context(b"mitm-proxy")
+            except (ssl.SSLError, AttributeError) as e:
+                # Non-fatal: we just fall back to full handshakes.
+                logger.debug("Could not set session id context: %s", e)
             if alpn:
                 ctx.set_alpn_protocols(list(alpn))
             self._server_ctx_cache[alpn] = ctx

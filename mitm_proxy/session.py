@@ -20,6 +20,7 @@ import asyncio
 import socket as _socket
 import threading
 import traceback
+import uuid
 from asyncio import StreamReader, StreamWriter
 from typing import Coroutine, Optional, Sequence
 from urllib.parse import urlparse
@@ -31,6 +32,7 @@ from .utls_bridge.sidecar import SidecarManager
 from ._common import logger, ProxyConfig, DEFAULT_CONFIG, Protocol
 from ._interceptor import (
     InterceptedResponse,
+    ProxyError,
     RequestInterceptor,
     _ResponseCapture,
 )
@@ -40,7 +42,7 @@ from ._io import (
     SocksProxyPool,
     TLSInterceptor,
 )
-from ._policy import DefaultPolicy, Policy
+from ._policy import DefaultPolicy, Policy, ResponseHeaders
 from ._http1 import Http1Handler
 from ._http2 import Http2Handler
 
@@ -97,7 +99,13 @@ class _ProxyHandler:
             if method == "CONNECT":
                 await self._handle_connect(client, path)
             else:
-                headers_dict = {k.lower(): v for k, v in raw_headers}
+                # ``raw_headers`` are raw wire bytes (preserved for fidelity);
+                # decode latin1 for the case-insensitive Host lookup only.
+                # latin1 is a lossless byte<->str mapping and Host is ASCII.
+                headers_dict = {
+                    k.decode("latin1").lower(): v.decode("latin1")
+                    for k, v in raw_headers
+                }
                 await self._handle_plain_http(
                     client, method, path, version, raw_headers, body, headers_dict,
                 )
@@ -121,7 +129,7 @@ class _ProxyHandler:
         method: str,
         target_url: str,
         version: str,
-        raw_headers: list[tuple[str, str]],
+        raw_headers: list[tuple[bytes, bytes]],
         body: bytes,
         headers_dict: dict[str, str],
     ) -> None:
@@ -352,10 +360,11 @@ class _ProxyHandler:
 
         try:
             target = f"{host}:{port}"
+            sid = self._proxy._session_id
             if socks:
-                cmd = f"CONNECT {target} socks5://{socks}\n"
+                cmd = f"CONNECT {target} socks5://{socks} sid={sid}\n"
             else:
-                cmd = f"CONNECT {target}\n"
+                cmd = f"CONNECT {target} sid={sid}\n"
 
             writer.write(cmd.encode("utf-8"))
             await writer.drain()
@@ -513,12 +522,15 @@ class SessionProxy:
 
     Two extension points
     ~~~~~~~~~~~~~~~~~~~~
-    * :meth:`set_header_rule` — flat URL→headers map.  Use this for
-      declarative header overrides driven by config or CLI.  Stored
-      as state on the active policy; clearing rules doesn't disturb
-      a custom policy.
+    * **Header rules** — declarative URL→headers merging, symmetric across
+      directions: :meth:`set_request_header_rule` and
+      :meth:`set_response_header_rule`.  Each takes an optional ``name`` so
+      several rules can be active at once.  Stored on the active policy;
+      clearing rules doesn't disturb a custom policy.
     * :meth:`set_policy` — full programmatic control.  Subclass
-      :class:`DefaultPolicy` to inherit hygiene + rule handling.
+      :class:`DefaultPolicy` and override a transform hook for anything
+      beyond header merging (status rewrites, conditional drops, body
+      inspection); call ``super()`` to keep hygiene + rules.
 
     Usage::
 
@@ -533,7 +545,7 @@ class SessionProxy:
 
         # configure browser: --proxy-server=127.0.0.1:{port}
 
-        proxy.set_header_rule(
+        proxy.set_request_header_rule(
             {"https://api.example.com/*"},
             [("X-API-Key", "secret")],
         )
@@ -561,6 +573,13 @@ class SessionProxy:
         self.host = host
         self.port = port
         self.config = config
+
+        # Stable identifier for this logical proxy session.  Sent to the TLS
+        # sidecar on every CONNECT (as "sid=") so the sidecar scopes session-
+        # ticket resumption to this session (and SOCKS exit) — resumption
+        # happens within the session like a real browser, but never crosses
+        # into another session sharing the same sidecar process.
+        self._session_id = uuid.uuid4().hex
 
         self._socks_pool = socks_pool
 
@@ -673,6 +692,14 @@ class SessionProxy:
                     [t.get_name() for t in pending],
                 )
 
+        # Phase 3.5: tell the sidecar to drop this session's TLS ticket
+        # caches.  Best-effort and scoped by our session id, so it never
+        # affects other SessionProxy instances sharing the sidecar process.
+        # If the sidecar is gone or unreachable this is a quiet no-op (the
+        # sidecar's bounded LRU reclaims the scope on its own regardless).
+        if self.sidecar is not None and self.sidecar.running:
+            await self.sidecar.close_session(self._session_id)
+
         # Now safe to drop the handler — no live task references it any
         # more, so the (SessionProxy → _handler → _proxy) cycle resolves
         # by refcount alone.
@@ -734,59 +761,136 @@ class SessionProxy:
 
     # -- header rules ------------------------------------------------------
 
-    def set_header_rule(
-        self, urls: set[str], headers: list[tuple[str, str]]
-    ) -> None:
-        """Set a header-modification rule on the active policy.
+    def _require_default_policy(self, op: str) -> DefaultPolicy:
+        """Return the active policy if it supports rules, else raise.
 
-        When a request URL matches any pattern in *urls*, the given
-        *headers* are merged into the outgoing request headers.
-
-        URL matching is consistent with :meth:`intercept`: patterns
-        without ``*`` or ``?`` are exact-string matches, patterns
-        containing them use :func:`fnmatch.fnmatch`-style globbing.
-        Mix exact and glob in the same call freely::
-
-            proxy.set_header_rule(
-                {"https://api.example.com/health",
-                 "https://api.example.com/v1/*"},
-                [("X-API-Key", "secret")],
-            )
-
-        Calling :meth:`set_header_rule` *replaces* any previous rule
-        on this policy.  The policy itself is preserved (custom
-        subclasses of :class:`DefaultPolicy` continue to apply their
-        overrides).
-
-        For request-time logic that can't be expressed as a flat
-        URL→headers map (cross-request state, conditional rewrites,
-        body inspection), subclass :class:`DefaultPolicy` and use
-        :meth:`set_policy` instead.
-
-        Raises:
-            TypeError: if the active policy doesn't support header rules
-                (i.e. it isn't a :class:`DefaultPolicy` or subclass).
+        The named-rule API is implemented by :class:`DefaultPolicy`; a
+        fully custom policy installed via :meth:`set_policy` may not have
+        it.  Centralised so every delegator gives the same error.
         """
         if not isinstance(self.policy, DefaultPolicy):
             raise TypeError(
-                f"set_header_rule requires a DefaultPolicy-compatible "
-                f"policy (got {type(self.policy).__name__}). "
-                f"Use set_policy(...) directly to install a custom policy."
+                f"{op} requires a DefaultPolicy-compatible policy "
+                f"(got {type(self.policy).__name__}). Use set_policy(...) "
+                f"to install a custom policy, or implement the rule API on it."
             )
-        self.policy.set_header_rule(urls, headers)
+        return self.policy
 
-    def clear_header_rule(self) -> None:
-        """Remove the active policy's header rule (policy itself stays installed).
+    def set_request_header_rule(
+        self,
+        urls: set[str],
+        headers: list[tuple[str, Optional[str]]],
+        *,
+        name: str = "default",
+    ) -> None:
+        """Set (or replace) a request-header rule on the active policy.
+
+        When a request URL matches any pattern in *urls*, *headers* are
+        merged into the outgoing request: each is set/overridden, or
+        *removed* if its value is ``None`` (``""`` keeps an empty value;
+        dropping an absent header is a no-op).  Pass distinct *name* values
+        to keep several rules active at once; omit *name* for the common
+        single-rule case (calling again then replaces it).  URL matching
+        is consistent with :meth:`intercept` (exact unless the pattern
+        contains ``*``)::
+
+            proxy.set_request_header_rule({"https://api.x.com/*"},
+                                          [("X-API-Key", "secret")])
+            proxy.set_request_header_rule({"https://*"}, [("Referer", None)],
+                                          name="strip-referer")
 
         Raises:
             TypeError: if the active policy doesn't support header rules.
         """
-        if not isinstance(self.policy, DefaultPolicy):
-            raise TypeError(
-                f"clear_header_rule requires a DefaultPolicy-compatible "
-                f"policy (got {type(self.policy).__name__})."
-            )
-        self.policy.clear_header_rule()
+        self._require_default_policy(
+            "set_request_header_rule"
+        ).set_request_header_rule(urls, headers, name=name)
+
+    def remove_request_header_rule(self, name: str = "default") -> bool:
+        """Remove a request rule by name.  Returns ``True`` if it existed."""
+        return self._require_default_policy(
+            "remove_request_header_rule"
+        ).remove_request_header_rule(name)
+
+    def clear_request_header_rules(self) -> None:
+        """Remove all request rules (hygiene still applies)."""
+        self._require_default_policy(
+            "clear_request_header_rules"
+        ).clear_request_header_rules()
+
+    def set_response_header_rule(
+        self,
+        urls: set[str],
+        headers: list[tuple[str, Optional[str]]],
+        *,
+        name: str = "default",
+    ) -> None:
+        """Set (or replace) a response-header rule on the active policy.
+
+        Symmetric with :meth:`set_request_header_rule`: when a response's
+        request URL matches *urls*, *headers* are merged into the response
+        before it reaches the browser — each set/overridden, or *removed*
+        if its value is ``None`` (``""`` keeps an empty value; dropping an
+        absent header is a no-op)::
+
+            proxy.set_response_header_rule({"https://*"}, [("Server", None)])
+
+        This is still *unconditional* merging.  To rewrite a status code or
+        drop a header only for some responses (e.g. block a redirect),
+        subclass :class:`DefaultPolicy`, override ``transform_response``,
+        and install it with :meth:`set_policy`.
+
+        Raises:
+            TypeError: if the active policy doesn't support header rules.
+            ValueError: if a framing header (Content-Length,
+                Transfer-Encoding, Connection) is set or dropped — changing
+                body framing desyncs the proxy and the browser.
+        """
+        self._require_default_policy(
+            "set_response_header_rule"
+        ).set_response_header_rule(urls, headers, name=name)
+
+    def remove_response_header_rule(self, name: str = "default") -> bool:
+        """Remove a response rule by name.  Returns ``True`` if it existed."""
+        return self._require_default_policy(
+            "remove_response_header_rule"
+        ).remove_response_header_rule(name)
+
+    def clear_response_header_rules(self) -> None:
+        """Remove all response rules (hygiene still applies)."""
+        self._require_default_policy(
+            "clear_response_header_rules"
+        ).clear_response_header_rules()
+
+    # -- policy ------------------------------------------------------------
+
+    def set_policy(self, policy: Policy) -> None:
+        """Install *policy* as the active policy, replacing the current one.
+
+        *policy* must satisfy the :class:`Policy` protocol.  Subclass
+        :class:`DefaultPolicy` to inherit hygiene, request rules, and
+        response rules; or implement every hook from scratch for full
+        control.  Hold the policy via ``weakref`` to the proxy as
+        ``DefaultPolicy`` does if you don't want it to keep the proxy
+        alive.
+
+        Note: :meth:`stop` resets the policy back to a fresh
+        :class:`DefaultPolicy` (clearing all rules and any custom policy),
+        so re-install after a stop/restart if needed.
+        """
+        # Runtime guard: the annotation says ``Policy``, but this is a
+        # public entry point and nothing stops a caller passing something
+        # that doesn't satisfy the protocol.  Check the hooks the handlers
+        # actually call rather than a static ``is None`` (which the type
+        # checker proves dead).
+        for hook in ("transform_request_headers", "transform_response_headers",
+                     "open_capture", "deliver_capture"):
+            if not callable(getattr(policy, hook, None)):
+                raise TypeError(
+                    f"policy is missing required hook {hook!r}; "
+                    f"it must satisfy the Policy protocol"
+                )
+        self.policy = policy
 
     # -- interception API --------------------------------------------------
 
@@ -841,9 +945,18 @@ class SessionProxy:
         pattern whose URL targets this host, so that callers blocked on
         ``cap.get()`` / ``cap.all()`` are unblocked immediately instead
         of hanging until their timeout.
+
+        The synthesised response carries the failure detail on its
+        :attr:`InterceptedResponse.error` field (typed
+        :class:`ProxyError`), so consumers can match on a stable code
+        (``ProxyError.TIMED_OUT`` etc.) without parsing the body.  The
+        body still embeds the same message for HTTP-client consumers.
         """
         scheme = "https" if port == 443 else "http"
         prefix = f"{scheme}://{host}"
+        # Classify once; every pattern that matches this host gets the
+        # same ProxyError instance (frozen dataclass, safe to share).
+        proxy_error = ProxyError.from_exception(error)
         error_body = f"CONNECT tunnel failed: {error}".encode("utf-8")
 
         with self._interceptor_lock:
@@ -867,17 +980,29 @@ class SessionProxy:
                         matched_patterns.append(pat)
 
                 for pat in matched_patterns:
+                    # Fresh ResponseHeaders per response so a consumer
+                    # that mutates resp.headers can't leak edits across
+                    # other matched patterns.  Status is set on the
+                    # typed field so resp.headers.status mirrors
+                    # resp.status_code, matching real captures.
+                    synth_headers = ResponseHeaders(
+                        [(b"content-type", b"text/plain")],
+                        status=502,
+                    )
                     resp = InterceptedResponse(
                         url=pat,
                         status_code=502,
-                        headers=[("content-type", "text/plain")],
+                        headers=synth_headers,
                         raw_body=error_body,
                         content_type="text/plain",
                         content_encoding="",
+                        error=proxy_error,
                     )
                     ic._deliver_threadsafe(pat, resp)
                     logger.debug(
-                        "[CONNECT-ERR] Delivered 502 to interceptor for pattern: %s",
+                        "[CONNECT-ERR] Delivered 502 (%s) to interceptor "
+                        "for pattern: %s",
+                        proxy_error.code,
                         pat,
                     )
 

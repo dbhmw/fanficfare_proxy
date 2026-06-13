@@ -39,12 +39,14 @@ from ._io import (
 )
 from ._interceptor import (
     InterceptedResponse,
+    ProxyError,
     RequestInterceptor,
 )
 from ._policy import (
     DefaultPolicy,
-    HeaderModifier,
     Policy,
+    RequestHeaders,
+    ResponseHeaders,
 )
 from .session import SessionProxy
 from .utls_bridge.sidecar import (
@@ -66,9 +68,11 @@ __all__ = [
     "Protocol",
     "RequestInterceptor",
     "InterceptedResponse",
+    "ProxyError",
     "DefaultPolicy",
     "Policy",
-    "HeaderModifier",
+    "RequestHeaders",
+    "ResponseHeaders",
     "SocksProxyPool",
     "SidecarManager",
     # Logging

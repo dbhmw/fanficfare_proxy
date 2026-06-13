@@ -70,14 +70,12 @@ class ProxyConfig:
         plus any SOCKS5 negotiation.
     idle_timeout:
         Maximum seconds without data flow before either side of an
-        h1 keep-alive or h2 session is torn down.  Tuned slightly
-        below typical browser idle timeouts (60 s) so the proxy
-        proactively closes before the browser does.
+        h1 keep-alive or h2 session is torn down.
     request_timeout:
         Maximum seconds for a single h1 request/response cycle.
     stream_timeout:
         Maximum seconds an h2 stream may stay alive without
-        receiving end-of-stream.  Reaped by ``_check_stream_timeouts``.
+        receiving end-of-stream.  Reaped by ``_StreamReaper``.
     read_buffer_size:
         Size of the ``asyncio`` read buffer passed to ``reader.read()``.
     """
