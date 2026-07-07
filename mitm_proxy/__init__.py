@@ -35,6 +35,7 @@ from ._io import (
     ManagedConnection,
     Socks5Client,
     SocksProxyPool,
+    SocksProxySession,
     TLSInterceptor,
 )
 from ._interceptor import (
@@ -74,6 +75,7 @@ __all__ = [
     "RequestHeaders",
     "ResponseHeaders",
     "SocksProxyPool",
+    "SocksProxySession",
     "SidecarManager",
     # Logging
     "logger",

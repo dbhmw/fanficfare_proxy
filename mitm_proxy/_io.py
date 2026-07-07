@@ -330,10 +330,38 @@ class Socks5Client:
                     pass
 
 
-class SocksProxyPool:
-    """Shared SOCKS5 proxy pool — loaded once, used by many ``SessionProxy`` instances.
+class SocksProxySession:
+    def __init__(self, session: str, socks_pool: Optional[SocksProxyPool] = None) -> None:
+        self.session = session
+        self._socks_pool = socks_pool
 
-    Proxies are loaded from a newline-delimited text file.  Each line
+        if socks_pool:
+            self.socks_proxy = socks_pool.assign()
+        else:
+            self.socks_proxy = None
+
+    def rotate_proxy(self) -> Optional[str]:
+        if not self._socks_pool:
+            logger.warning("No SOCKS pool configured, cannot rotate")
+            return None
+        new_proxy = self._socks_pool.rotate(self.socks_proxy)
+        old = self.socks_proxy
+        self.socks_proxy = new_proxy
+        logger.info("Rotated SOCKS proxy %s: %s -> %s", self.session, old, new_proxy)
+        return new_proxy
+
+    def set_proxy(self, proxy: str) -> Optional[str]:
+        self.socks_proxy = proxy
+        logger.info("Set SOCKS proxy %s", proxy)
+        return self.socks_proxy
+
+    def get_proxy(self) -> Optional[str]:
+        # logger.debug("Returned %s proxy for %s", self.socks_proxy, self.session)
+        return self.socks_proxy
+
+
+class SocksProxyPool:
+    """Proxies are loaded from a newline-delimited text file.  Each line
     should be ``host:port``.
 
     Thread-safe for read access (the tuple is immutable); call
@@ -413,30 +441,22 @@ class TLSInterceptor:
             ctx.load_cert_chain(self.ca_cert_path, self.ca_key_path)
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
-            # Enable session resumption toward the browser.  Each browser
-            # CONNECT to a new origin triggers a fresh MITM handshake; without
-            # resumption every one is a full handshake (key exchange + cert
-            # parse) on the proxy's event-loop thread, which is the busiest
-            # thread we have.  Resumption lets the browser present a prior
-            # session and skip the expensive asymmetric crypto.
+            # Session resumption toward the browser works out of the box.
+            # Each browser CONNECT to a new origin triggers a fresh MITM
+            # handshake; without resumption every one is a full handshake
+            # (key exchange + cert parse) on the proxy's event-loop thread,
+            # the busiest thread we have.  OpenSSL issues session tickets by
+            # default for server contexts (TLS 1.3 NewSessionTicket and RFC
+            # 5077 tickets for TLS 1.2), so a browser presenting a prior
+            # session skips the expensive asymmetric crypto automatically.
             #
-            # TLS 1.3: OpenSSL issues NewSessionTickets automatically for a
-            #   server context, so tickets already work once a session id
-            #   context is set.
-            # TLS 1.2: server-side resumption is a no-op UNLESS a session-id
-            #   context is configured, so set one.  It's an opaque tag (max
-            #   32 bytes) scoping the server's session cache; a constant is
-            #   fine here since every cached context presents the same CA
-            #   identity.
-            #
-            # Resumption state lives in the SSLContext, and these contexts are
-            # cached by ALPN tuple (below), so it persists across connections
-            # for the life of the proxy — which is exactly what we want.
-            try:
-                ctx.set_session_id_context(b"mitm-proxy")
-            except (ssl.SSLError, AttributeError) as e:
-                # Non-fatal: we just fall back to full handshakes.
-                logger.debug("Could not set session id context: %s", e)
+            # This is ticket-based (stateless) resumption, which needs no
+            # session-id context.  CPython's ssl module doesn't expose
+            # SSL_CTX_set_session_id_context anyway, and the session-id
+            # context is only relevant to the stateful server-side cache,
+            # which the stdlib also doesn't expose — so there is nothing to
+            # configure here.  (`ctx.num_tickets`, default 2, is the one
+            # knob available if TLS 1.3 ticket count ever needs tuning.)
             if alpn:
                 ctx.set_alpn_protocols(list(alpn))
             self._server_ctx_cache[alpn] = ctx

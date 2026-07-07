@@ -169,7 +169,7 @@ class Http1Handler:
         ``handle_with_buffered()`` (one-shot for an already-read request).
         """
         url = f"{scheme}://{target_host}{path}"
-        socks = self._proxy.socks_proxy
+        socks = self._proxy.socks_proxy.get_proxy()
         logger.trace("[REQ] %s %s via %s", method, url, socks or "direct")
 
         # Build the protocol-agnostic request view.  h1 carries method/path

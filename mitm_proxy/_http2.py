@@ -2051,7 +2051,7 @@ class Http2Handler:
                 return
 
             url = f"{scheme}://{authority}{path}"
-            socks = self._proxy.socks_proxy
+            socks = self._proxy.socks_proxy.get_proxy()
             logger.trace(
                 "[REQ] %s %s via %s (h2 stream %d)",
                 method,

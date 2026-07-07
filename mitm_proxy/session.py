@@ -39,7 +39,7 @@ from ._interceptor import (
 from ._io import (
     ManagedConnection,
     Socks5Client,
-    SocksProxyPool,
+    SocksProxySession,
     TLSInterceptor,
 )
 from ._policy import DefaultPolicy, Policy, ResponseHeaders
@@ -179,7 +179,7 @@ class _ProxyHandler:
             self._proxy._track_connection(target)
             display_host = f"{host}:{port}" if port != 80 else host
 
-            socks = self._proxy.socks_proxy
+            socks = self._proxy.socks_proxy.get_proxy()
             logger.trace(
                 "[REQ] %s http://%s%s via %s",
                 method,
@@ -336,7 +336,7 @@ class _ProxyHandler:
             raise ConnectionError("Sidecar not available")
 
         sidecar_addr = sidecar.addr
-        socks = self._proxy.socks_proxy
+        socks = self._proxy.socks_proxy.get_proxy()
 
         sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
         try:
@@ -479,7 +479,7 @@ class _ProxyHandler:
         self, host: str, port: int
     ) -> ManagedConnection:
         """Open a TCP connection to the target, optionally through SOCKS5."""
-        socks = self._proxy.socks_proxy
+        socks = self._proxy.socks_proxy.get_proxy()
         if socks:
             reader, writer = await Socks5Client.connect(
                 socks, host, port, self.config.connect_timeout
@@ -562,7 +562,7 @@ class SessionProxy:
         self,
         ca_cert: str,
         ca_key: str,
-        socks_pool: Optional[SocksProxyPool] = None,
+        socks_proxy: SocksProxySession,
         host: str = "127.0.0.1",
         port: int = 0,
         config: ProxyConfig = DEFAULT_CONFIG,
@@ -581,12 +581,7 @@ class SessionProxy:
         # into another session sharing the same sidecar process.
         self._session_id = uuid.uuid4().hex
 
-        self._socks_pool = socks_pool
-
-        if socks_pool:
-            self.socks_proxy = socks_pool.assign()
-        else:
-            self.socks_proxy = None
+        self.socks_proxy = socks_proxy
 
         self.sidecar: Optional[SidecarManager] = sidecar
 
@@ -652,7 +647,7 @@ class SessionProxy:
             "SessionProxy listening on %s:%d (socks: %s)",
             self.host,
             self.port,
-            self.socks_proxy or "direct",
+            self.socks_proxy.get_proxy() or "direct",
         )
         return self.port
 
@@ -708,7 +703,6 @@ class SessionProxy:
         # so a stopped-then-restarted SessionProxy behaves like new.
         # Custom policies installed via set_policy are also dropped.
         self.policy = DefaultPolicy(self)
-        self.socks_proxy = None
         logger.info("SessionProxy stopped (was :%d)", self.port)
 
     # -- task management ---------------------------------------------------
@@ -733,31 +727,6 @@ class SessionProxy:
             return
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
-
-    # -- SOCKS proxy management --------------------------------------------
-
-    def rotate_proxy(self) -> Optional[str]:
-        """Switch to a different SOCKS proxy from the pool.
-
-        Returns the new proxy address, or ``None`` if no pool is configured.
-        """
-        if not self._socks_pool:
-            logger.warning("No SOCKS pool configured, cannot rotate")
-            return None
-        new_proxy = self._socks_pool.rotate(self.socks_proxy)
-        old = self.socks_proxy
-        self.socks_proxy = new_proxy
-        logger.info("Rotated SOCKS proxy: %s -> %s", old, new_proxy)
-        return new_proxy
-
-    def set_proxy(self, proxy: str) -> Optional[str]:
-        self.socks_proxy = proxy
-        logger.info("Set SOCKS proxy %s", proxy)
-        return self.socks_proxy
-
-    def get_proxy(self) -> Optional[str]:
-        """Return the currently assigned SOCKS proxy address."""
-        return self.socks_proxy
 
     # -- header rules ------------------------------------------------------
 

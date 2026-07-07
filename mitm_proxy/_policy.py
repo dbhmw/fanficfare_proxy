@@ -279,6 +279,30 @@ class _Headers:
         self._dirty = True
         return vb
 
+    def insert_after(
+        self,
+        anchor: bytes,
+        name: bytes,
+        value: bytes,
+    ) -> None:
+        """Insert ``(name, value)`` immediately after the first header whose
+        name case-insensitively matches *anchor*.
+
+        Regular headers only — *anchor* and *name* must not be pseudo-headers.
+        ``KeyError`` if *anchor* isn't present.  Does not de-duplicate.
+
+        All three args are raw ``bytes`` (no ``str`` coercion).
+        """
+        self._reject_pseudo(anchor)   # anchor can't be a pseudo-header
+        self._reject_pseudo(name)     # nor the inserted name
+        target = self._fold(anchor)
+        for i, (k, _v) in enumerate(self._pairs):
+            if self._fold(k) == target:
+                self._pairs.insert(i + 1, (name, value))
+                self._dirty = True
+                return
+        raise KeyError(anchor)
+
     # -- serialisation --
 
     @property
@@ -966,18 +990,6 @@ class DefaultPolicy:
     def clear_response_header_rules(self) -> None:
         """Remove all response rules (hygiene still applies)."""
         self._response_rules = {}
-
-    # -- legacy aliases (kept so existing callers keep working) ------------
-
-    def set_header_rule(
-        self, urls: set[str], headers: list[tuple[str, Optional[str]]]
-    ) -> None:
-        """Deprecated alias for :meth:`set_request_header_rule`."""
-        self.set_request_header_rule(urls, headers)
-
-    def clear_header_rule(self) -> None:
-        """Deprecated alias for :meth:`remove_request_header_rule`."""
-        self.remove_request_header_rule()
 
     def matches_rule(self, url: str) -> bool:
         """Return ``True`` if *url* matches any request rule's patterns."""
