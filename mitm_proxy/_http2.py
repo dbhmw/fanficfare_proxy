@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import time
 import traceback
+from collections import OrderedDict
 from typing import TYPE_CHECKING, Optional
 
 import h2.config
@@ -239,11 +240,21 @@ class _StreamMap:
     ``len()`` and ``clear()``.
     """
 
-    __slots__ = ("_by_client", "_by_target")
+    __slots__ = ("_by_client", "_by_target", "_retired")
+
+    #: How many retired client→target mappings to remember for the sole
+    #: purpose of resolving PRIORITY dependencies (see ``resolve_target``).
+    #: Chrome anchors each request on a *recent* stream, so a small window
+    #: covers effectively every real lookup; the cap bounds memory on
+    #: long-lived connections.
+    RETIRED_LIMIT = 128
 
     def __init__(self) -> None:
         self._by_client: dict[int, Http2Stream] = {}
         self._by_target: dict[int, Http2Stream] = {}
+        # client_stream_id -> target_stream_id for streams that are gone
+        # from the live maps.  Insertion-ordered, trimmed from the front.
+        self._retired: OrderedDict[int, int] = OrderedDict()
 
     # -- mutators --
 
@@ -251,21 +262,50 @@ class _StreamMap:
         self._by_client[stream.client_stream_id] = stream
         self._by_target[stream.target_stream_id] = stream
 
+    def _retire(self, client_stream_id: int, target_stream_id: int) -> None:
+        """Remember a client→target mapping after the stream leaves the map.
+
+        Depending on a closed stream is explicitly legal (RFC 9113 §5.3.1
+        note / RFC 7540 §5.3.4): the peer may have discarded its priority
+        state and will treat it as a dependency on the root, which is the
+        same place our fallback would have put it anyway.  So this is
+        never worse than falling back to 0, and usually better.
+        """
+        self._retired[client_stream_id] = target_stream_id
+        self._retired.move_to_end(client_stream_id)
+        while len(self._retired) > self.RETIRED_LIMIT:
+            self._retired.popitem(last=False)
+
+    def alias(self, client_stream_id: int, target_stream_id: int) -> None:
+        """Record a stand-in target ID for a client stream we never forwarded.
+
+        Stubbed and refused requests consume a client stream ID but open no
+        target stream, so a later request that anchors its PRIORITY chain on
+        one has nothing to point at.  Aliasing it to *its* own resolved
+        dependency collapses the link transitively, which is exactly the
+        chain a browser that had never issued the skipped request would
+        have produced.
+        """
+        self._retire(client_stream_id, target_stream_id)
+
     def remove_by_client(self, client_stream_id: int) -> Optional[Http2Stream]:
         stream = self._by_client.pop(client_stream_id, None)
         if stream is not None:
             self._by_target.pop(stream.target_stream_id, None)
+            self._retire(client_stream_id, stream.target_stream_id)
         return stream
 
     def remove_by_target(self, target_stream_id: int) -> Optional[Http2Stream]:
         stream = self._by_target.pop(target_stream_id, None)
         if stream is not None:
             self._by_client.pop(stream.client_stream_id, None)
+            self._retire(stream.client_stream_id, target_stream_id)
         return stream
 
     def clear(self) -> None:
         self._by_client.clear()
         self._by_target.clear()
+        self._retired.clear()
 
     # -- lookups --
 
@@ -274,6 +314,18 @@ class _StreamMap:
 
     def get_by_target(self, target_stream_id: int) -> Optional[Http2Stream]:
         return self._by_target.get(target_stream_id)
+
+    def resolve_target(self, client_stream_id: int) -> int:
+        """Map a client stream ID to a target one for PRIORITY purposes.
+
+        Checks live streams first, then the retired window.  Returns 0
+        (the root) when the ID is unknown — an anchor that old is one the
+        origin has long since forgotten too.
+        """
+        stream = self._by_client.get(client_stream_id)
+        if stream is not None:
+            return stream.target_stream_id
+        return self._retired.get(client_stream_id, 0)
 
     # -- iteration --
 
@@ -2072,6 +2124,19 @@ class Http2Handler:
             # Buffered frames are flushed by _flush_both after this event.
             stub = self._proxy.policy.should_stub(url)
             if stub is not None:
+                # This client stream opens no target stream, so a later
+                # request that anchors its PRIORITY chain here would find
+                # nothing and collapse to the root.  Alias it to its own
+                # resolved dependency instead: the origin never saw this
+                # request, and the chain it *would* have seen is the one
+                # that skips straight past it.
+                _spu = event.priority_updated
+                streams.alias(
+                    client_stream_id,
+                    streams.resolve_target(_spu.depends_on)
+                    if _spu is not None and _spu.depends_on
+                    else 0,
+                )
                 resp_headers = [
                     (b":status", b"200"),
                     (b"content-type", b"text/html; charset=utf-8"),
@@ -2126,14 +2191,42 @@ class Http2Handler:
             # standalone PRIORITY frame.  That extra frame shifts the Akamai
             # fingerprint from the correct |0|m,a,s,p to the broken |m,a,s,p1:220.
             pu = event.priority_updated
+            target_dep: Optional[int] = None
             if pu is not None:
                 stream._had_inline_priority = True
+
+                # pu.depends_on is a *client-side* stream ID and is
+                # meaningless in the target's ID space, which we allocate
+                # independently.  Remap it, exactly as the standalone
+                # PriorityUpdated branch below already does.  Any client
+                # stream we never forwarded (stubbed, refused, malformed)
+                # permanently offsets the two ID spaces, so an unmapped
+                # depends_on drifts into a collision with target_stream_id
+                # itself and h2 rejects the frame.
+                #
+                # This must happen BEFORE send_headers rather than in a
+                # try/except around it: h2 transitions the stream state
+                # machine and burns the ID *before* _add_frame_priority
+                # validates, so a ProtocolError leaves a phantom
+                # HALF_CLOSED_LOCAL stream that emitted no bytes, counts
+                # against MAX_CONCURRENT_STREAMS, and can never be retried.
+                # Catching the exception afterwards is too late.
+                raw_dep = pu.depends_on or 0
+                target_dep = 0
+                if raw_dep and raw_dep != client_stream_id:
+                    target_dep = streams.resolve_target(raw_dep)
+                # A stream may not depend on itself (RFC 9113 §5.3.1);
+                # fall back to the root, which is what a dependency on an
+                # already-retired stream means anyway.
+                if target_dep == target_stream_id:
+                    target_dep = 0
+
             target_h2.send_headers(
                 target_stream_id,
                 modified,
                 end_stream=end_stream,
                 priority_weight=pu.weight if pu is not None else None,
-                priority_depends_on=pu.depends_on if pu is not None else None,
+                priority_depends_on=target_dep,
                 priority_exclusive=pu.exclusive if pu is not None else None,
             )
 
@@ -2261,10 +2354,14 @@ class Http2Handler:
                             depends_on=target_dep,
                             exclusive=event.exclusive,
                         )
-                    except (h2.exceptions.ProtocolError, ValueError) as e:
+                    except (h2.exceptions.H2Error, ValueError) as e:
                         # prioritize() rejects self-dependency and other
                         # malformed inputs; drop the frame rather than
                         # tearing down the stream — PRIORITY is advisory.
+                        # Catch H2Error, not ProtocolError: h2 has error
+                        # classes (RFC1122Error) that sit outside the
+                        # ProtocolError branch of the hierarchy and would
+                        # otherwise escape to _pump's generic handler.
                         logger.trace(
                             "PRIORITY forward dropped (client=%d, target=%d): %s",
                             event.stream_id, stream.target_stream_id, e,
@@ -2531,25 +2628,37 @@ class Http2Handler:
             )
 
         elif isinstance(event, h2.events.PriorityUpdated):
-            # Target sent PRIORITY toward us.  Forward to the browser so
-            # the browser's stream dependency tree stays in sync with
-            # what the origin advertised.  Targets very rarely send
-            # PRIORITY (deprecated per RFC 9113 §5.3.1), but forward for
-            # completeness.
-            stream = streams.get_by_target(event.stream_id) if event.stream_id else None
-            if stream:
-                try:
-                    client_h2.prioritize(
-                        stream_id=stream.client_stream_id,
-                        weight=event.weight,
-                        depends_on=event.depends_on,
-                        exclusive=event.exclusive,
-                    )
-                except (h2.exceptions.ProtocolError, ValueError) as e:
-                    logger.trace(
-                        "PRIORITY forward dropped (target=%d, client=%d): %s",
-                        event.stream_id, stream.client_stream_id, e,
-                    )
+            # Target sent PRIORITY toward us.  We deliberately do NOT
+            # forward it to the browser.
+            #
+            # ``client_h2`` is a *server-side* H2Connection (we serve the
+            # browser), and h2 refuses server-side prioritisation
+            # outright: prioritize() raises RFC1122Error("Servers SHOULD
+            # NOT prioritize streams.") on its first line, before it even
+            # looks at the arguments.  So this branch could never forward
+            # anything.  Worse, RFC1122Error subclasses H2Error rather
+            # than ProtocolError, so it slipped past the narrow except
+            # here and surfaced from the generic handler in _pump as a
+            # spurious "[HTTP/2] Error processing target event
+            # PriorityUpdated" warning on every origin PRIORITY frame.
+            #
+            # Dropping it is also the correct behaviour on the merits.
+            # Priority is strictly advisory and RFC 9113 §5.3.1 deprecates
+            # it; h2 declines to implement server-side prioritisation
+            # because clients handle conflicting priority information
+            # poorly.  And unlike the client→target direction, nothing
+            # here is fingerprint-bearing: this is the local leg to our
+            # own browser, not the wire an origin inspects.
+            #
+            # Note for anyone restoring this: event.depends_on is a
+            # *target*-side stream ID.  It would need remapping through
+            # ``streams`` before it could mean anything to the browser.
+            if event.stream_id:
+                logger.trace(
+                    "PRIORITY from target dropped (target_stream_id=%d): "
+                    "h2 forbids server-side prioritize",
+                    event.stream_id,
+                )
 
         elif isinstance(event, h2.events.RemoteSettingsChanged):
             # Target changed its SETTINGS mid-session.  h2 has already
