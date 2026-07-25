@@ -29,7 +29,6 @@ from fetcher import (DownloadWillBeginParams,
     ProxyLoop)
 
 from curl_cffi import AsyncSession, ProxySpec
-from http.cookiejar import CookieJar, Cookie
 
 # used for the timestamp in session
 import time
@@ -75,6 +74,9 @@ class RequestCookie(TypedDict):
     expires: int
     secure: bool
     httpOnly: bool
+    sameSite: NotRequired[Literal["Strict", "Lax", "None"]]
+    session: NotRequired[bool]
+    partitionKey: NotRequired[CookiePartitionKey]
 
 class CookiePartitionKey(TypedDict):
     topLevelSite: str
@@ -882,9 +884,14 @@ class DriverlessHandle:
         logger.debug("POST URL: %s", path)
         #urllib_wantedurl: urllib.parse.SplitResult = urllib.parse.urlsplit(path)
         #await tab.get("https://" + str(urllib_wantedurl[1]), wait_load=True)
-        await tab.get(path, wait_load=True)
+        self.drivenbrowser.mitm_instance.set_stub_rule({path}, b"", name="stub_name")
+        try:
+            await tab.get(path, wait_load=True)
+            await self.page_loaded(tab)
+        finally:
+            # Drop the rule before the real POST
+            self.drivenbrowser.mitm_instance.remove_stub_rule(name="stub_name")
 
-        await self.page_loaded(tab)
         # AO3 does not respond with the elements that indicate that user has logged in.
         # await tab.execute_cdp_cmd("Network.clearBrowserCache")
 
@@ -895,7 +902,6 @@ class DriverlessHandle:
         headers['Content-Type'] = "application/x-www-form-urlencoded"
         params_dict: dict[str, str] = json.loads(params)
         encoded_params: str = urllib.parse.urlencode(params_dict)
-
         headers['Referer'] = path
 
         javascript_code = f"""
@@ -1145,9 +1151,11 @@ class DriverlessHandle:
 
         tab, drivenbrowser_id = await self.drivenbrowser.get_tab(self.requestid)
 
+        await self.drivenbrowser.clear_cookies()
+
         if request["cookies"]:
             logger.debug("We got extra cookies")
-            await asyncio.gather(*(tab.add_cookie(cookie) for cookie in request["cookies"]))
+            await self.drivenbrowser.add_cookies(request["cookies"])
 
         attempt = 0
         while attempt < 4:
@@ -1191,7 +1199,7 @@ class DriverlessHandle:
             if result[3] == ProxyError.NAME_NOT_RESOLVED:
                 break
             elif result[3] == ProxyError.TTL_EXPIRED:
-                await self.drivenbrowser.set_socks_proxy("ch-zrh-wg-socks5-503.relays.mullvad.net:1080")
+                logger.warning(await self.drivenbrowser.get_current_socks_proxy())
                 continue
 
             if result[0] != 404 and 400 < result[0] < 500:
@@ -1229,52 +1237,6 @@ class CffiHandle:
         self.timeout: float = timeout
         self.stats: Stats = stats
 
-    @staticmethod
-    def cookiejar_to_dict(jar: CookieJar) -> list[ResponseCookie]:
-        return [ResponseCookie(
-                    name = c.name,
-                    value = c.value or "",
-                    domain = c.domain,
-                    path = c.path,
-                    expires = c.expires if c.expires is not None else -1,
-                    size = len(c.name) + len(c.value or ""),
-                    secure = c.secure,
-                    httpOnly = c._rest.get("HttpOnly", False),
-                    sameSite = c._rest.get("SameSite"),
-                    session = c.discard)
-                for c in jar
-                ]
-
-    @staticmethod
-    def to_cookie(c: RequestCookie) -> Cookie:
-        expires = c["expires"]
-        if expires in (-1, 0):
-            expires = None
-
-        rest: dict[str, str | None] = {}
-        if c["httpOnly"]:
-            rest["HttpOnly"] = None
-
-        return Cookie(
-            version=0,
-            name=c["name"],
-            value=c["value"],
-            port=None,
-            port_specified=False,
-            domain=c["domain"],
-            domain_specified=bool(c["domain"]),
-            domain_initial_dot=c["domain"].startswith("."),
-            path=c["path"],
-            path_specified=bool(c["path"]),
-            secure=c["secure"],
-            expires=expires,
-            discard=False,
-            comment=None,
-            comment_url=None,
-            rest=rest,
-            rfc2109=False,
-        )
-
     async def get(self, request: ServerRequest, session: AsyncSession) -> ServerResponse:
         logger.info(f"Cffi GET {request["url"]}")
 
@@ -1297,7 +1259,7 @@ class CffiHandle:
                 return {"code": 0, "content_type": "None/None", "cookies": "None", "source": base64.b64encode(b"Err").decode(), "errors": "ConnClosed"}
             raise e
 
-        out_cookies = json.dumps(self.cookiejar_to_dict(session.cookies.jar))
+        out_cookies = json.dumps(self.cffi_fetcher.cookiejar_to_dict(session.cookies.jar))
 
         if response.headers.get("cf-mitigated", "").lower() == "challenge":
             return {"code": response.status_code, "content_type": response.headers.get("content-type"), "cookies": out_cookies, "source": base64.b64encode(response.content).decode(), "errors": "Cloudflare"}
@@ -1312,16 +1274,19 @@ class CffiHandle:
 
         response = await session.post(request["url"], headers=headers, impersonate="chrome133a", data=params)
 
-        out_cookies = json.dumps(self.cookiejar_to_dict(session.cookies.jar))
+        out_cookies = json.dumps(self.cffi_fetcher.cookiejar_to_dict(session.cookies.jar))
         logger.debug(response.headers)
-        if response.headers.get("cf-mitigated", "").lower() == "challenge":
+        if response.headers.get("cf-mitigated", "").lower() == "challenge" or response.status_code == 403:
             return {"code": response.status_code, "content_type": response.headers.get("content-type"), "cookies": out_cookies, "source": base64.b64encode(response.content).decode(), "errors": "Cloudflare"}
 
         return {"code": response.status_code, "content_type": response.headers.get("content-type"), "cookies": out_cookies, "source": base64.b64encode(response.content).decode(), "errors": ""}
 
     async def fetch(self, request: ServerRequest) -> ServerResponse:
         session = await self.cffi_fetcher.get_browser()
-        jar_cookies = [self.to_cookie(c) for c in request["cookies"]]
+
+        session.cookies.jar.clear()
+
+        jar_cookies = [self.cffi_fetcher.to_cookie(c) for c in request["cookies"]]
         for ck in jar_cookies:
             logger.debug(f"Adding {ck}")
             session.cookies.jar.set_cookie(ck)
@@ -1335,16 +1300,20 @@ class CffiHandle:
 
         if response["errors"] == "ConnClosed":
             return await self.fetch(request=request)
-        
+
+        logger.info(f"Response code: {response["code"]}")
+        logger.debug(f"Response type: {response["content_type"]}")
         logger.debug(response["cookies"])
 
         if response["code"] not in [200, 404]:
-            if request["image"] == "True" and not response["content_type"].lower().startswith('image'):
-                logger.warning("Failed to get an image!")
-                self.stats.add_failed(request["url"], f"Failed to fetch the image {response["code"]}")
             logger.debug(f"Cffi err {response["errors"]}")
+            logger.debug(response["source"])
             # else:
             #     self.stats.add_failed(request["url"], f"{str(response["code"])}: {response["errors"]}")
+        if request["image"] == "True" and not response["content_type"].lower().startswith('image'):
+            logger.warning(f"Failed to get an image! {request["url"]} {response["content_type"]}")
+            response["errors"] = "No Image"
+            # self.stats.add_failed(request["url"], f"Failed to fetch the image {response["code"]}")
 
         return response
 
@@ -1360,12 +1329,12 @@ class ClientRequest:
 
         try:
             result = await CffiHandle(self.session.weak_fetcher, self.stats, self.timeout).fetch(request)
-            if not result["errors"] == "Cloudflare":
+            if result["errors"] == "":
                 return result
             else:
-                logger.warning("Cloudflare "+request["session"])
-        except Exception as e:
-            logger.warning(e)
+                logger.info(f"Cffi {request["session"]} error {result["errors"]}")
+        except Exception:
+            logger.warning(traceback.format_exc())
 
         result = await DriverlessHandle(self.stats, self.session.weak_browser, reqid, self.timeout).fetch(request)
         await self.session.weak_browser.destroy_tab(reqid, self.session.in_use)

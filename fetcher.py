@@ -14,6 +14,7 @@ import sys
 import logging
 
 import curl_cffi
+from http.cookiejar import CookieJar, Cookie
 
 from selenium_driverless import webdriver
 from selenium_driverless.types.target import Target
@@ -34,15 +35,30 @@ from mitm_proxy import (
     SocksProxyPool,
     SocksProxySession,
     ProxyConfig,
-    SidecarManager,
-    RequestInterceptor
+    SidecarManager
     )
 
 if TYPE_CHECKING:
-    from .driverless import Init, ResponseCookie
+    from .driverless import Init, ResponseCookie, RequestCookie, CookiePartitionKey
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
+
+class CookieParam(TypedDict):
+    name: str
+    value: str
+    url: NotRequired[str]
+    domain: NotRequired[str]
+    path: NotRequired[str]
+    secure: NotRequired[bool]
+    httpOnly: NotRequired[bool]
+    sameSite: NotRequired[Literal["Strict", "Lax", "None"]]
+    expires: NotRequired[float]
+    priority: NotRequired[Literal["Low", "Medium", "High"]]
+    sameParty: NotRequired[bool]
+    sourceScheme: NotRequired[Literal["Unset", "NonSecure", "Secure"]]
+    sourcePort: NotRequired[int]
+    partitionKey: NotRequired[CookiePartitionKey]
 
 class DownloadWillBeginParams(TypedDict):
     frameId: str
@@ -278,6 +294,53 @@ class CffiFetcher:
         self.socks_pool = socks_pool
         self.cfii_session: Optional[curl_cffi.AsyncSession] = None
 
+    @staticmethod
+    def cookiejar_to_dict(jar: CookieJar) -> list[ResponseCookie]:
+        return [{
+                "name": c.name,
+                "value": c.value or "",
+                "domain": c.domain,
+                "path": c.path,
+                "expires": c.expires if c.expires is not None else -1,
+                "size": len(c.name) + len(c.value or ""),
+                "secure": c.secure,
+                "httpOnly": c._rest.get("HttpOnly", False),
+                "sameSite": c._rest.get("SameSite"),
+                "session": c.discard}
+            for c in jar]
+
+    @staticmethod
+    def to_cookie(c: RequestCookie) -> Cookie:
+        expires = c["expires"]
+        if expires in (-1, 0):
+            expires = None
+
+        rest: dict[str, str | None] = {}
+        if c["httpOnly"]:
+            rest["HttpOnly"] = None
+        if same_site := c.get("sameSite"):
+            rest["SameSite"] = same_site
+
+        return Cookie(
+            version=0,
+            name=c["name"],
+            value=c["value"],
+            port=None,
+            port_specified=False,
+            domain=c["domain"],
+            domain_specified=c["domain"].startswith("."),
+            domain_initial_dot=c["domain"].startswith("."),
+            path=c["path"],
+            path_specified=bool(c["path"]),
+            secure=c["secure"],
+            expires=expires,
+            discard=bool(c.get("session", expires is None)),
+            comment=None,
+            comment_url=None,
+            rest=rest,
+            rfc2109=False,
+        )
+
     async def get_browser(self) -> curl_cffi.AsyncSession:
         if self.cfii_session is not None:
             return self.cfii_session
@@ -396,12 +459,50 @@ class DrivenBrowser:
         await tab.execute_cdp_cmd("Network.setCacheDisabled", {"cacheDisabled": True}, timeout=5)
         return tab, self.current_id
 
+    @staticmethod
+    def _to_cdp_cookie(c: RequestCookie) -> CookieParam:
+        param: CookieParam = {
+            "name": c["name"],
+            "value": c["value"],
+            "domain": c["domain"],
+            "path": c["path"],
+            "secure": c["secure"],
+            "httpOnly": c["httpOnly"],
+        }
+        if not c.get("session") and c["expires"] not in (-1, 0):
+            param["expires"] = float(c["expires"])
+
+        same_site = c.get("sameSite")
+        if same_site:
+            if same_site == "None" and not c["secure"]:
+                logger.debug(f"Dropping SameSite=None on non-secure cookie {c["name"]}")
+            else:
+                param["sameSite"] = same_site
+
+        if part := c.get("partitionKey"):
+            param["partitionKey"] = part
+        return param
+
+    async def add_cookies(self, cookies: list[RequestCookie]) -> None:
+        if not self.context:
+            raise Exception("Context was collected")
+
+        await self.context.execute_cdp_cmd("Storage.setCookies", {
+                "cookies": [self._to_cdp_cookie(c) for c in cookies],
+                "browserContextId": self.context._context_id})
+
     async def get_cookies(self) -> list[ResponseCookie]:
         if not self.context:
             raise Exception("Context was collected")
         cookie_list: dict[str, list[ResponseCookie]] = await self.context.execute_cdp_cmd("Storage.getCookies", {"browserContextId": self.context._context_id})
         logger.debug(cookie_list)
         return cookie_list["cookies"]
+
+    async def clear_cookies(self) -> None:
+        if not self.context:
+            raise Exception("Context was collected")
+        logger.debug(f"Clearing cookies {self.session}")
+        await self.context.execute_cdp_cmd("Storage.clearCookies", {"browserContextId": self.context._context_id})
 
     async def rotate_socks_proxy(self) -> bool:
         """

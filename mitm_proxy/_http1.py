@@ -172,6 +172,25 @@ class Http1Handler:
         socks = self._proxy.socks_proxy.get_proxy()
         logger.trace("[REQ] %s %s via %s", method, url, socks or "direct")
 
+        # -- stub short-circuit ------------------------------------------------
+        # Serve a canned same-origin response without contacting the target.
+        # ``_read_request`` has already fully consumed the request body, so the
+        # connection is at a clean message boundary and stays keep-alive.  h1
+        # has no per-stream flow control, so there is nothing to account for.
+        stub = self._proxy.policy.should_stub(url)
+        if stub is not None:
+            head = (
+                b"HTTP/1.1 200 OK\r\n"
+                b"Content-Type: text/html; charset=utf-8\r\n"
+                b"Content-Length: " + str(len(stub)).encode("latin1") + b"\r\n"
+                b"Cache-Control: no-store\r\n"
+                b"\r\n"
+            )
+            client.writer.write(head + stub)
+            await client.writer.drain()
+            client.touch()
+            return True, False  # keep-alive, not an upgrade; target untouched
+
         # Build the protocol-agnostic request view.  h1 carries method/path
         # in the request line and has no :scheme/:authority on the wire, but
         # we seed all four pseudo-fields so the policy sees a uniform view;

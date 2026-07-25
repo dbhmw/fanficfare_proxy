@@ -831,6 +831,34 @@ class SessionProxy:
             "clear_response_header_rules"
         ).clear_response_header_rules()
 
+    # -- stub rules --------------------------------------------------------
+
+    def set_stub_rule(
+        self,
+        urls: set[str],
+        body: bytes = b"",
+        *,
+        name: str = "default",
+    ) -> None:
+        """Serve *body* as a 200 same-origin document for matching URLs,
+        short-circuiting the upstream fetch — the handlers answer on the
+        browser's own connection/stream and never open a target stream.  See
+        :meth:`DefaultPolicy.should_stub`.  An empty *body* is enough to commit
+        a same-origin document and costs no flow-control window.
+
+        Raises:
+            TypeError: if the active policy doesn't support stub rules.
+        """
+        self._require_default_policy(
+            "set_stub_rule"
+        ).set_stub_rule(urls, body, name=name)
+
+    def remove_stub_rule(self, name: str = "default") -> bool:
+        """Remove a stub rule by name.  Returns ``True`` if it existed."""
+        return self._require_default_policy(
+            "remove_stub_rule"
+        ).remove_stub_rule(name)
+
     # -- policy ------------------------------------------------------------
 
     def set_policy(self, policy: Policy) -> None:

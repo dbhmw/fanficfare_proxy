@@ -2060,6 +2060,31 @@ class Http2Handler:
                 client_stream_id,
             )
             view = self._proxy.policy.transform_request_headers(url, view)
+
+            # -- stub short-circuit --------------------------------------------
+            # Answer on the browser's own stream and never open a target
+            # stream. The origin-facing h2 fingerprint (SETTINGS/WINDOW_UPDATE)
+            # was already sent at session setup (start_session), so declining
+            # to forward one stream cannot affect it. Navigations are GET (no
+            # request DATA), so there is nothing to flow-control here; any DATA
+            # that did arrive for this (now un-mapped) stream is credited back
+            # to the connection window in the DataReceived branch below.
+            # Buffered frames are flushed by _flush_both after this event.
+            stub = self._proxy.policy.should_stub(url)
+            if stub is not None:
+                resp_headers = [
+                    (b":status", b"200"),
+                    (b"content-type", b"text/html; charset=utf-8"),
+                    (b"content-length", str(len(stub)).encode("latin1")),
+                    (b"cache-control", b"no-store"),
+                ]
+                client_h2.send_headers(
+                    client_stream_id, resp_headers, end_stream=(len(stub) == 0),
+                )
+                if stub:
+                    client_h2.send_data(client_stream_id, stub, end_stream=True)
+                return
+
             # HTTP/2 forbids connection-level headers in a HEADERS frame
             # (RFC 9113 §8.2.2).  This is a framing rule the h2 handler owns
             # — not policy hygiene — so we enforce it here on the way to the
@@ -2130,6 +2155,28 @@ class Http2Handler:
                     receiver_stream_id=stream.target_stream_id,
                     direction=stream.to_target,
                 )
+            elif event.flow_controlled_length:
+                # DATA for a stream we are not forwarding — a stubbed request
+                # (should_stub) or one already reset/closed. We won't relay it,
+                # but its bytes STILL count against the *connection-level*
+                # receive window: a closed stream does not exempt connection
+                # flow control (RFC 9113 §6.9.1 / §5.2.1). Without this credit
+                # the shared browser<->proxy window leaks and eventually stalls
+                # every stream. Stub navigations are GET (no DATA), so this is
+                # a defensive path that also fixes the pre-existing leak for
+                # DATA racing a stream reset. acknowledge_received_data credits
+                # the connection window first, unconditionally, then no-ops the
+                # (absent) stream window. The WINDOW_UPDATE it buffers is
+                # flushed by _flush_both after this event.
+                try:
+                    client_h2.acknowledge_received_data(
+                        event.flow_controlled_length, event.stream_id,
+                    )
+                except Exception as e:
+                    logger.trace(
+                        "connection-window ack for un-mapped stream %d failed: %s",
+                        event.stream_id, e,
+                    )
 
         elif isinstance(event, h2.events.StreamReset):
             stream = streams.get_by_client(event.stream_id)

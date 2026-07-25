@@ -515,6 +515,23 @@ class _HeaderRule:
     matcher: _UrlMatcher
     headers: tuple[tuple[str, Optional[str]], ...]
 
+
+@dataclass(frozen=True)
+class _StubRule:
+    """A named URL→body rule: when *matcher* matches, the proxy serves *body*
+    as a 200 same-origin ``text/html`` document on the browser's own
+    connection and never contacts the target.
+
+    Used to land a tab same-origin without fetching the real page — an empty
+    body is enough to commit a same-origin document, and an empty body has
+    zero flow-control footprint (no DATA frame; END_STREAM rides the response
+    HEADERS on h2).
+    """
+
+    matcher: _UrlMatcher
+    body: bytes
+
+
 class Policy(TypingProtocol):
     """The policy contract the proxy requires.
 
@@ -619,6 +636,21 @@ class Policy(TypingProtocol):
         Called once the response body has been fully received.  The
         capture's status, headers, and body buffer are populated by
         the handler before this is invoked.
+        """
+        ...
+
+    # -- stub lifecycle ----------------------------------------------------
+
+    def should_stub(self, url: str) -> Optional[bytes]:
+        """Return a canned body to serve for *url* without contacting the
+        target, or ``None`` to proxy normally.
+
+        Pure and synchronous like every other hook.  When it returns a body,
+        the handlers reply ``200 text/html`` with that body (empty is fine) on
+        the browser's own connection/stream and never open the upstream
+        request.  Because it runs *before* any target stream is created, it
+        cannot affect the origin-facing h2 fingerprint (already sent at
+        session setup).
         """
         ...
 
@@ -728,6 +760,7 @@ class DefaultPolicy:
         # dict) so the event-loop thread reads a consistent snapshot.
         self._request_rules: dict[str, _HeaderRule] = {}
         self._response_rules: dict[str, _HeaderRule] = {}
+        self._stub_rules: dict[str, _StubRule] = {}
         if urls or headers:
             self.set_request_header_rule(urls or set(), headers or [])
 
@@ -990,6 +1023,42 @@ class DefaultPolicy:
     def clear_response_header_rules(self) -> None:
         """Remove all response rules (hygiene still applies)."""
         self._response_rules = {}
+
+    # -- stub API ----------------------------------------------------------
+    #
+    # Same copy-on-write discipline as the header rules: each mutation rebinds
+    # a fresh dict, so the proxy-loop thread reads a consistent snapshot in
+    # should_stub() concurrently with off-loop set_*/remove_* calls, no lock.
+
+    def set_stub_rule(
+        self,
+        urls: set[str],
+        body: bytes = b"",
+        *,
+        name: str = _DEFAULT_RULE_NAME,
+    ) -> None:
+        """Serve *body* (200 ``text/html``) for any URL matching *urls*
+        instead of proxying upstream.  Matching mirrors the header rules
+        (exact unless the pattern contains ``*``); re-using a *name* replaces
+        just that rule.  An empty *body* still commits a same-origin document
+        and has zero flow-control footprint."""
+        rule = _StubRule(_UrlMatcher.compile(urls), body)
+        self._stub_rules = {**self._stub_rules, name: rule}
+
+    def remove_stub_rule(self, name: str = _DEFAULT_RULE_NAME) -> bool:
+        """Remove a stub rule by name.  Returns ``True`` if it existed."""
+        if name not in self._stub_rules:
+            return False
+        new = dict(self._stub_rules)
+        del new[name]
+        self._stub_rules = new
+        return True
+
+    def should_stub(self, url: str) -> Optional[bytes]:
+        for rule in self._stub_rules.values():
+            if rule.matcher.matches(url):
+                return rule.body
+        return None
 
     def matches_rule(self, url: str) -> bool:
         """Return ``True`` if *url* matches any request rule's patterns."""
