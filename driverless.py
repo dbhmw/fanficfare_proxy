@@ -12,6 +12,7 @@ from asyncio import StreamReader, StreamWriter, StreamReaderProtocol
 from selenium_driverless.types.by import By
 from selenium_driverless.types.target import Target
 from selenium_driverless.types.webelement import NoSuchElementException, WebElement
+from selenium_driverless.types.deserialize import StaleJSRemoteObjReference
 from cdp_socket.exceptions import CDPError
 from websockets.exceptions import ConnectionClosedError
 
@@ -863,8 +864,11 @@ class DriverlessHandle:
             return True
         return False
 
-    async def page_loaded(self, tab: Target) -> None:
+    async def page_loaded(self, tab: Target, n: int = 0) -> None:
         state: str = "None"
+        if n > 10:
+            logger.warning("Page failed to load!")
+            return
         try:
             state = await tab.eval_async("return document.readyState")
             logger.debug(state)
@@ -876,6 +880,10 @@ class DriverlessHandle:
                 logger.debug((state, x))
         except TimeoutError:
             logger.warning("Timeout!")
+        except StaleJSRemoteObjReference as e:
+            logger.warning(str(e))
+            await asyncio.sleep(2)
+            return await self.page_loaded(tab, n+1)
         if state != "complete":
             logger.warning("Page failed to load in time")
 
