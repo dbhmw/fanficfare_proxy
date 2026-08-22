@@ -5,3 +5,4 @@ h2
 uvloop
 brotli
 zstandard
+curl_cffi

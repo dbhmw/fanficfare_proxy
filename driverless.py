@@ -713,16 +713,16 @@ class DriverlessHandle:
         for q in range(1,3):
             logger.info("Cloudflare present.")
 
-            if q > 1:
-                await asyncio.sleep(random.uniform(1.1, 2.8))
-            else:
-                await asyncio.sleep(random.uniform(5.1, 8.2))
+            # if q > 1:
+            #     await asyncio.sleep(random.uniform(1.1, 2.8))
+            # else:
+            #     await asyncio.sleep(random.uniform(5.1, 8.2))
 
             try:
                 container = await tab.find_element(
                     By.XPATH,
-                    """//input[@type='hidden' and starts-with(@id, 'cf-chl-widget-') and substring(@id, string-length(@id) - string-length('_response') + 1) = '_response']/..""",
-                    timeout=2,
+                    """//input[@type='hidden' and starts-with(@id, 'cf-chl-widget-') and substring(@id, string-length(@id) - string-length('_response') + 1) = '_response']/../div""",
+                    timeout=4,
                 )
             except Exception as e:
                 logger.debug(e)
@@ -734,7 +734,7 @@ class DriverlessHandle:
                     raise NoSuchElementException()
                 iframe: WebElement = await shadow_document.find_element(By.CSS_SELECTOR, "iframe", timeout=3)
                 await iframe.scroll_to()
-                content_document: WebElement = await asyncio.wait_for(iframe.content_document, timeout=10)
+                content_document: WebElement = await asyncio.wait_for(iframe.content_document, timeout=8)
                 body: WebElement = await content_document.find_element(By.CSS_SELECTOR, "body", timeout=2)
                 nested_shadow_document: Optional[WebElement] = await body.shadow_root
                 if not nested_shadow_document:
@@ -753,7 +753,6 @@ class DriverlessHandle:
                 else:
                     return False
 
-                logger.info("Clicked")
                 frame_rect: dict[str, int] = await iframe.rect
                 cords: list[int] = await checkbox.mid_location()
                 x: int = frame_rect["x"] + cords[0]
@@ -764,6 +763,7 @@ class DriverlessHandle:
                 #await tab.get_screenshot_as_file('/home/r/Downloads/png1.png')
 
                 await tab.pointer.click(x_or_elem=x, y=y)
+                logger.info("Clicked")
 
                 current_text: str = "None"
                 for _ in range(8):
@@ -1260,7 +1260,7 @@ class CffiHandle:
             response = await session.get(request["url"],
                                         headers=headers,
                                         proxies=proxy,
-                                        impersonate="chrome133a")
+                                        impersonate="chrome146")
         except Exception as e:
             logger.debug(str(e))
             if "(56) Connection closed abruptly" in str(e):
@@ -1280,7 +1280,7 @@ class CffiHandle:
 
         headers = {'Referer': request["url"], "sec-ch-ua": None, "sec-ch-ua-mobile": None, "sec-ch-ua-platform": None, "user-agent": self.cffi_fetcher.chromes_user_agent}
 
-        response = await session.post(request["url"], headers=headers, impersonate="chrome133a", data=params)
+        response = await session.post(request["url"], headers=headers, impersonate="chrome146", data=params)
 
         out_cookies = json.dumps(self.cffi_fetcher.cookiejar_to_dict(session.cookies.jar))
         logger.debug(response.headers)
