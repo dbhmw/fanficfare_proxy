@@ -572,6 +572,8 @@ class SessionProxy:
 
         self.host = host
         self.port = port
+        # Address actually bound; callers connect to this, not `host`.
+        self.bound_host: str = host
         self.config = config
 
         # Stable identifier for this logical proxy session.  Sent to the TLS
@@ -641,11 +643,24 @@ class SessionProxy:
             reuse_address=True,
         )
 
-        sock = self._server.sockets[0]
-        self.port = sock.getsockname()[1]
+        # Port 0 binds one socket per resolved address, each with its
+        # own port. Prefer IPv4, which is what callers dial.
+        sockets = self._server.sockets
+        chosen = next((s for s in sockets if s.family == _socket.AF_INET),
+                      sockets[0])
+        sockname = chosen.getsockname()
+        self.bound_host = sockname[0]
+        self.port = sockname[1]
+        if len(sockets) > 1:
+            logger.debug(
+                "SessionProxy bound %d addresses for host %r (%s); using %s",
+                len(sockets), self.host,
+                ", ".join(f"{s.getsockname()[0]}:{s.getsockname()[1]}"
+                          for s in sockets),
+                self.bound_host)
         logger.info(
             "SessionProxy listening on %s:%d (socks: %s)",
-            self.host,
+            self.bound_host,
             self.port,
             self.socks_proxy.get_proxy() or "direct",
         )

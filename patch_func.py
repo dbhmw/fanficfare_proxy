@@ -11,6 +11,7 @@ from cdp_socket.socket import SingleCDPSocket
 from cdp_socket.exceptions import SocketExcitedError,CDPError
 from selenium_driverless.types.target import Target, TargetInfo
 from selenium_driverless.types.context import Context
+from selenium_driverless.scripts import geometry as _sd_geometry
 from selenium_driverless.scripts.driver_utils import add_cookie
 from selenium_driverless.webdriver import Chrome
 from selenium_driverless.types.options import Options as ChromeOptions
@@ -60,6 +61,31 @@ async def _patched_close(self, code=1000, reason=''):
 SingleCDPSocket.close = _patched_close
 
 
+# numpy>=2.5 removed 2-D vectors from np.cross, which
+# selenium_driverless.geometry still uses for captcha clicks.
+class _Numpy2DCross:
+    def __init__(self, np_mod):
+        self._np = np_mod
+
+    def __getattr__(self, name):
+        return getattr(self._np, name)
+
+    def cross(self, a, b, *args, **kwargs):
+        _np = self._np
+        a_arr = _np.asarray(a)
+        b_arr = _np.asarray(b)
+        if (a_arr.ndim and b_arr.ndim
+                and a_arr.shape[-1] == 2 and b_arr.shape[-1] == 2
+                and not args and not kwargs):
+            return a_arr[..., 0] * b_arr[..., 1] - a_arr[..., 1] * b_arr[..., 0]
+        return _np.cross(a, b, *args, **kwargs)
+
+
+_orig_geometry_np = _sd_geometry.np
+if not isinstance(_orig_geometry_np, _Numpy2DCross):
+    _sd_geometry.np = _Numpy2DCross(_orig_geometry_np)
+
+
 _orig_window_handles = Context.window_handles
 @property
 async def _patched_window_handles(self) -> list[TargetInfo]:
@@ -100,32 +126,56 @@ async def _patched_new_context(self, proxy_bypass_list: typing.List[str] = None,
 Chrome.new_context = _patched_new_context
 
 
+_DEV_MODE_ATTEMPTS = 3
+
+
 async def enable_developer_mode(self, timeout: float = 10):
     """enable developer mode"""
-    if not self._is_developer_mode:
+    if self._is_developer_mode:
+        return
+
+    script = """
+        async function make_dev_global(){
+            await chrome.developerPrivate.updateProfileConfiguration({
+                inDeveloperMode: true
+            });
+        };
+        await make_dev_global()
+    """
+
+    last_exc: typing.Optional[BaseException] = None
+    for attempt in range(1, _DEV_MODE_ATTEMPTS + 1):
         self._is_developer_mode = True
         page = None
         try:
             base_ctx = self._base_context
-            page: Context = await base_ctx.new_window("tab", "chrome://extensions", activate=False)
-            script = """
-                async function make_dev_global(){
-                    await chrome.developerPrivate.updateProfileConfiguration({
-                        inDeveloperMode: true
-                    });
-                };
-                await make_dev_global()
-            """
+            page = await base_ctx.new_window("tab", "chrome://extensions", activate=False)
             await asyncio.sleep(0.1)
             await page.eval_async(script, timeout=timeout, unique_context=False)
         except Exception as e:
+            last_exc = e
             EXC_HANDLER(e)
             self._is_developer_mode = False
-            if page:
-                await page.close()
-            return await self.enable_developer_mode()
+            # Closing over a dead socket raises and hides the real error.
+            if page is not None:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+            continue
+
         self._is_developer_mode = True
-        await page.close()
+        try:
+            await page.close()
+        except Exception:
+            pass
+        return
+
+    raise RuntimeError(
+        f"Could not enable developer mode after {_DEV_MODE_ATTEMPTS} "
+        f"attempts; the browser needs rebuilding") from last_exc
+
+
 setattr(Chrome, 'enable_developer_mode', enable_developer_mode)
 
 

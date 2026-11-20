@@ -278,6 +278,11 @@ class Init:
             if hasattr(args, 'impersonate_chrome') and args.impersonate_chrome
             else self.config.get("server", "impersonate", fallback='')
         )
+        self.no_curl: bool = (
+            args.no_curl
+            if hasattr(args, 'no_curl')
+            else False
+        )
 
     def prepserver(self) -> None:
         self.loop = asyncio.new_event_loop()
@@ -497,7 +502,7 @@ class ProxyServer:
         try:
             heartbeat = asyncio.create_task(self.heartbeat(writer, request["heartbeat"]))
             try:
-                client = ClientRequest(self.stats, client_session)
+                client = ClientRequest(self.stats, client_session, self.init.no_curl)
                 weakref.finalize(client, lambda: logger.debug("Garbage collected client"))
                 client_task = asyncio.create_task(client.main(request))
                 client_session.in_use += 1
@@ -629,7 +634,7 @@ class ProxyServer:
             str(len(code)).zfill(2)
             + str(len(content_type)).zfill(2)
             + str(len(source)).zfill(9)
-            + str(len(cookies)).zfill(5) #18
+            + str(len(cookies)).zfill(6) #19
         ).encode("utf-8")
 
         packet = header + code + content_type + source + cookies
@@ -639,7 +644,7 @@ class ProxyServer:
         comp_packet = zlib.compress(packet)
         if b'\0\0\0\xFF\xFF\xFF\0\0\0' in comp_packet:
             raise MessageFormatingError("Misplaced end marker")
-        if len(cookies) > 9999:
+        if len(cookies) > 99999:
             logger.critical("Cookies are too long!")
             self.init.terminated()
 
@@ -793,7 +798,8 @@ class DriverlessHandle:
             except NoSuchElementException:
                 logger.debug("Captcha is gone?")
             except Exception as e:
-                logger.debug(e)
+                logger.warning("Captcha solve attempt failed: %s: %s",
+                               type(e).__name__, e)
             finally:
                 await asyncio.sleep(random.randint(1, 3))
                 await tab.refresh()
@@ -1057,6 +1063,7 @@ class DriverlessHandle:
 
                 async with self.drivenbrowser.mitm_instance.intercept(links) as cap:
                     req = asyncio.ensure_future(tab.get(links[0], referrer=referer, wait_load=False, timeout=self.timeout))
+                    # await asyncio.sleep(30)
                     async for resp in cap:
                         status_code = resp.status_code
                         source = resp.body
@@ -1159,11 +1166,12 @@ class DriverlessHandle:
 
         tab, drivenbrowser_id = await self.drivenbrowser.get_tab(self.requestid)
 
-        await self.drivenbrowser.clear_cookies()
+        # Prefer tab-scoped CDP calls; context-scoped calls can miss cookies.
+        await self.drivenbrowser.clear_cookies(tab)
 
         if request["cookies"]:
             logger.debug("We got extra cookies")
-            await self.drivenbrowser.add_cookies(request["cookies"])
+            await self.drivenbrowser.add_cookies(request["cookies"], tab)
 
         attempt = 0
         while attempt < 4:
@@ -1201,9 +1209,6 @@ class DriverlessHandle:
                 tab, drivenbrowser_id = await self.drivenbrowser.get_tab(self.requestid)
                 continue
 
-            if result[0] == 525:
-                continue
-
             if result[3] == ProxyError.NAME_NOT_RESOLVED:
                 break
             elif result[3] == ProxyError.TTL_EXPIRED:
@@ -1232,10 +1237,10 @@ class DriverlessHandle:
                 self.stats.add_failed(request["url"], f"{str(result[0])}: {result[3]}")
 
         out_cookies: str = "None"
-        raw_cookies: list[ResponseCookie] = await self.drivenbrowser.get_cookies()
+        raw_cookies: list[ResponseCookie] = await self.drivenbrowser.get_cookies(tab)
         if raw_cookies:# and request["image"] == "False":
             out_cookies = json.dumps(raw_cookies)
-        logger.debug(out_cookies)
+        # logger.debug(out_cookies)
 
         return {"code": result[0], "content_type": result[1], "cookies": out_cookies, "source": base64.b64encode(result[2]).decode(), "errors": result[3]}
 
@@ -1250,7 +1255,7 @@ class CffiHandle:
 
         proxy: Optional[ProxySpec] = None
         if socks_address := self.cffi_fetcher.get_current_socks_proxy():
-            proxy = {"all": "socks://"+socks_address}
+            proxy = {"all": "socks5h://"+socks_address}
 
         headers = {"sec-ch-ua": None, "sec-ch-ua-mobile": None, "sec-ch-ua-platform": None, "user-agent": self.cffi_fetcher.chromes_user_agent}
         if ref := request["headers"].get('Referer'):
@@ -1260,7 +1265,7 @@ class CffiHandle:
             response = await session.get(request["url"],
                                         headers=headers,
                                         proxies=proxy,
-                                        impersonate="chrome146")
+                                        impersonate="chrome152")
         except Exception as e:
             logger.debug(str(e))
             if "(56) Connection closed abruptly" in str(e):
@@ -1280,7 +1285,7 @@ class CffiHandle:
 
         headers = {'Referer': request["url"], "sec-ch-ua": None, "sec-ch-ua-mobile": None, "sec-ch-ua-platform": None, "user-agent": self.cffi_fetcher.chromes_user_agent}
 
-        response = await session.post(request["url"], headers=headers, impersonate="chrome146", data=params)
+        response = await session.post(request["url"], headers=headers, impersonate="chrome152", data=params)
 
         out_cookies = json.dumps(self.cffi_fetcher.cookiejar_to_dict(session.cookies.jar))
         logger.debug(response.headers)
@@ -1311,13 +1316,13 @@ class CffiHandle:
 
         logger.info(f"Response code: {response["code"]}")
         logger.debug(f"Response type: {response["content_type"]}")
-        logger.debug(response["cookies"])
 
         if response["code"] not in [200, 404]:
             logger.debug(f"Cffi err {response["errors"]}")
-            logger.debug(response["source"])
-            # else:
-            #     self.stats.add_failed(request["url"], f"{str(response["code"])}: {response["errors"]}")
+
+        if response["code"] == 525:
+            response["errors"] = "525 cloudflare"
+        
         if request["image"] == "True" and not response["content_type"].lower().startswith('image'):
             logger.warning(f"Failed to get an image! {request["url"]} {response["content_type"]}")
             response["errors"] = "No Image"
@@ -1326,21 +1331,25 @@ class CffiHandle:
         return response
 
 class ClientRequest:
-    def __init__(self, stats: Stats, session: Session) -> None:
+    def __init__(self, stats: Stats, session: Session, no_curl: bool) -> None:
         self.stats: Stats = stats
         self.session: Session = session
         self.timeout: float = 60.0
+        self.no_curl: bool = no_curl
 
     async def main(self, request: ServerRequest) -> ServerResponse:
         result: ServerResponse = {"code": -1, "content_type": "None", "cookies": r"{}", "source": base64.b64encode(b"Failed to get a page.").decode(), "errors": ""}
         reqid = random.randint(-100000, 100000)
 
         try:
-            result = await CffiHandle(self.session.weak_fetcher, self.stats, self.timeout).fetch(request)
+            if not self.no_curl:
+                result = await CffiHandle(self.session.weak_fetcher, self.stats, self.timeout).fetch(request)
+            else:
+                result["errors"] = "Curl is off"
             if result["errors"] == "":
                 return result
             else:
-                logger.info(f"Cffi {request["session"]} error {result["errors"]}")
+                logger.info(f"Cffi {request["session"]} error '{result["errors"]}'")
         except Exception:
             logger.warning(traceback.format_exc())
 
@@ -1383,6 +1392,7 @@ parser.add_argument('--mitm-key', dest='mitm_ca_key', type=str, metavar='PATH', 
 parser.add_argument('--mitm-cert', dest='mitm_ca_cert', type=str, metavar='PATH', help=argparse.SUPPRESS)
 
 parser.add_argument('--impersonate', dest='impersonate_chrome', type=str, default='', help=argparse.SUPPRESS)
+parser.add_argument('--no-curl', dest='no_curl', action='store_true', help=argparse.SUPPRESS)
 
 handler: Callable[[BaseException], None] = (lambda e: logger.debug(f'Event-handler: {e.__class__.__name__}: {str(e)}'))
 sys.modules["selenium_driverless"].EXC_HANDLER = handler

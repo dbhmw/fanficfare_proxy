@@ -368,6 +368,8 @@ class DrivenBrowser:
         self.session = session
         self.sessiontabs: dict[int, Target] = {}
         self.context: Optional[Context] = None
+        # Serialises context creation and teardown for this session.
+        self._context_lock: asyncio.Lock = asyncio.Lock()
         self.current_id: int = random.randint(0, 100)
         self.downloads_dir: str = tempfile.mkdtemp(prefix=f"downloads_{session}_")
         logger.debug("Created dir %s", self.downloads_dir)
@@ -384,7 +386,16 @@ class DrivenBrowser:
         if controller is None:
             raise Exception
 
-        proxy: str = f"http://127.0.0.1:{self.proxy_instance_port}"
+        # Dial the address the mitm actually bound, not a hardcoded one.
+        host: str = getattr(self.mitm_instance, "bound_host", "127.0.0.1")
+        # A wildcard bind is not a dialable address.
+        if host == "0.0.0.0":
+            host = "127.0.0.1"
+        elif host == "::":
+            host = "::1"
+        if ":" in host:
+            host = f"[{host}]"
+        proxy: str = f"http://{host}:{self.proxy_instance_port}"
         context = await controller.get_context(proxy=proxy,download_dir=self.downloads_dir)
         if not context:
             raise Exception("NO CONTEXT!")
@@ -423,22 +434,58 @@ class DrivenBrowser:
 
         self.set_intercept_policy(NoRedirectPolicy)
 
+        # Fail here rather than on every fetch with ERR_PROXY_CONNECTION_FAILED.
+        await self._verify_proxy_reachable()
+
+    async def _verify_proxy_reachable(self, timeout: float = 2.0) -> bool:
+        host = getattr(self.mitm_instance, "bound_host", "127.0.0.1")
+        if host == "0.0.0.0":
+            host = "127.0.0.1"
+        elif host == "::":
+            host = "::1"
+        try:
+            _, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, self.proxy_instance_port),
+                timeout=timeout)
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+            return True
+        except Exception as e:
+            logger.error(
+                "mitm for %s is not reachable at %s:%d (%s). The browser "
+                "will fail with ERR_PROXY_CONNECTION_FAILED. Check whether "
+                "config host %r resolves to several addresses.",
+                self.session, host, self.proxy_instance_port,
+                e, self.config.host)
+            return False
+
     async def get_browser(self) -> Context:
         if self.context is not None:
             return self.context
 
-        logger.info("Starting new browser for %s", self.session)
+        async with self._context_lock:
+            # Another caller may have built it while we waited.
+            if self.context is not None:
+                return self.context
 
-        self.context = await self.start_browser()
+            logger.info("Starting new browser for %s", self.session)
 
-        if not self.context:
-            raise RuntimeError("No context")
+            self.context = await self.start_browser()
 
-        if self.virt_disp:
-            await self.context.set_window_rect(x=0,y=0,width=1920,height=1080)
+            if not self.context:
+                raise RuntimeError("No context")
 
-        logger.debug("Handed browser for %d", self.current_id)
-        return self.context
+            if self.virt_disp:
+                await self.context.set_window_rect(x=0,y=0,width=1920,height=1080)
+
+            logger.debug("Handed browser for %d", self.current_id)
+            return self.context
+
+    # Each rebuild costs a new exit and a fresh clearance solve.
+    MAX_TAB_ATTEMPTS = 3
 
     async def get_tab(self, requestid: int) -> tuple[Target, int]:
         if requestid in self.sessiontabs:
@@ -446,18 +493,36 @@ class DrivenBrowser:
         if self.current_id < 0:
             raise RuntimeError("Shutdown?")
 
-        try:
-            browser_context = await self.get_browser()
-            tab: Target = await browser_context.new_window(type_hint="tab", url="about:blank")
-            del browser_context
-        except (ConnectionClosedError, TimeoutError):
-            await self.broken_browser(self.current_id)
-            return await self.get_tab(requestid)
+        # Bounded rebuild loop; start_browser() can raise bare exceptions
+        # while get_context() is repairing the main driver.
+        for attempt in range(1, self.MAX_TAB_ATTEMPTS + 1):
+            if self.current_id < 0:
+                raise RuntimeError("Shutdown?")
+            try:
+                browser_context = await self.get_browser()
+                tab: Target = await browser_context.new_window(type_hint="tab", url="about:blank")
+                del browser_context
+                await tab.execute_cdp_cmd("Network.enable", {})
+                await tab.execute_cdp_cmd("Network.setCacheDisabled", {"cacheDisabled": True}, timeout=5)
+            except Exception as e:
+                if attempt >= self.MAX_TAB_ATTEMPTS:
+                    logger.error(
+                        "Could not get a tab for %s after %d attempts: %s: %s",
+                        self.session, attempt, type(e).__name__, e)
+                    raise
+                logger.warning(
+                    "Could not get a tab for %s (attempt %d/%d): %s: %s -- rebuilding",
+                    self.session, attempt, self.MAX_TAB_ATTEMPTS,
+                    type(e).__name__, e)
+                await self.broken_browser(self.current_id)
+                await asyncio.sleep(2 ** (attempt - 1))
+                continue
 
-        self.sessiontabs[requestid] = tab
-        await tab.execute_cdp_cmd("Network.enable", {})
-        await tab.execute_cdp_cmd("Network.setCacheDisabled", {"cacheDisabled": True}, timeout=5)
-        return tab, self.current_id
+            # Register only after both CDP calls succeed.
+            self.sessiontabs[requestid] = tab
+            return tab, self.current_id
+
+        raise RuntimeError("get_tab exhausted its attempts without a result")
 
     @staticmethod
     def _to_cdp_cookie(c: RequestCookie) -> CookieParam:
@@ -483,26 +548,104 @@ class DrivenBrowser:
             param["partitionKey"] = part
         return param
 
-    async def add_cookies(self, cookies: list[RequestCookie]) -> None:
+    async def _storage_cmd(self, cmd: str, args: Optional[dict] = None,
+                           tab: Optional[Target] = None) -> Optional[dict]:
+        """Send a Storage.* command to the browser session, not a page."""
+        params = dict(args or {})
+        context_id = None
+        if tab is not None:
+            try:
+                context_id = await tab.browser_context_id
+            except Exception as e:
+                logger.debug("Could not read the tab's context id: %s", e)
+        context_id = context_id or getattr(self.context, "context_id", None)
+        if context_id:
+            params["browserContextId"] = context_id
+        return await self.context.base_target.execute_cdp_cmd(cmd, params)
+
+    async def add_cookies(self, cookies: list[RequestCookie],
+                          tab: Optional[Target] = None) -> None:
+        """Inject client-supplied cookies, preferring the tab-scoped call."""
         if not self.context:
             raise Exception("Context was collected")
 
-        await self.context.execute_cdp_cmd("Storage.setCookies", {
-                "cookies": [self._to_cdp_cookie(c) for c in cookies],
-                "browserContextId": self.context._context_id})
+        params = {"cookies": [self._to_cdp_cookie(c) for c in cookies]}
+        if tab is not None:
+            try:
+                await tab.execute_cdp_cmd("Network.setCookies", params)
+                return
+            except Exception as e:
+                logger.warning("Network.setCookies failed for %s: %s: %s",
+                               self.session, type(e).__name__, e)
+        await self._storage_cmd("Storage.setCookies", params, tab=tab)
 
-    async def get_cookies(self) -> list[ResponseCookie]:
+    async def _context_mismatch(self, tab: Target) -> Optional[tuple[str, str]]:
+        """Return (held, actual) context ids when they differ."""
+        try:
+            info = await tab.info
+            actual = info.browser_context_id
+        except Exception as e:
+            logger.debug("Could not read target info: %s", e)
+            return None
+        held = getattr(self.context, "context_id", None)
+        if actual and held and actual != held:
+            return (held, actual)
+        return None
+
+    async def get_cookies(self, tab: Optional[Target] = None) -> list[ResponseCookie]:
+        """Return the tab's cookies, falling back to the browser context."""
         if not self.context:
             raise Exception("Context was collected")
-        cookie_list: dict[str, list[ResponseCookie]] = await self.context.execute_cdp_cmd("Storage.getCookies", {"browserContextId": self.context._context_id})
-        logger.debug(cookie_list)
-        return cookie_list["cookies"]
 
-    async def clear_cookies(self) -> None:
+        cookies: list[ResponseCookie] = []
+        if tab is not None:
+            try:
+                res = await tab.execute_cdp_cmd("Network.getCookies")
+                cookies = (res or {}).get("cookies") or []
+            except Exception as e:
+                logger.warning("Network.getCookies failed for %s: %s: %s",
+                               self.session, type(e).__name__, e)
+        if cookies:
+            return cookies
+
+        try:
+            cookie_list = await self._storage_cmd("Storage.getCookies", tab=tab)
+        except Exception as e:
+            logger.warning("Storage.getCookies failed for %s: %s: %s",
+                           self.session, type(e).__name__, e)
+            return []
+
+        cookies = (cookie_list or {}).get("cookies") or []
+        if cookies:
+            logger.warning(
+                "Network.getCookies gave nothing for %s but the browser "
+                "context has %d cookie(s); the tab is probably gone",
+                self.session, len(cookies))
+        else:
+            logger.warning("No cookies from either call for %s", self.session)
+            if tab is not None:
+                mismatch = await self._context_mismatch(tab)
+                if mismatch:
+                    logger.error(
+                        "Context mismatch for %s: we hold %s, the tab is in "
+                        "%s. Every browserContextId-scoped call in this "
+                        "session is addressing the wrong jar.",
+                        self.session, *mismatch)
+        return cookies
+
+    async def clear_cookies(self, tab: Optional[Target] = None) -> None:
+        """Clear cookies through the tab, falling back to the browser context."""
         if not self.context:
             raise Exception("Context was collected")
-        logger.debug(f"Clearing cookies {self.session}")
-        await self.context.execute_cdp_cmd("Storage.clearCookies", {"browserContextId": self.context._context_id})
+        logger.debug("Clearing cookies %s", self.session)
+        if tab is not None:
+            try:
+                await tab.execute_cdp_cmd("Network.clearBrowserCookies")
+                return
+            except Exception as e:
+                logger.warning("Network.clearBrowserCookies failed for %s: "
+                               "%s: %s", self.session, type(e).__name__, e)
+        await self._storage_cmd("Storage.clearCookies", tab=tab)
 
     async def rotate_socks_proxy(self) -> bool:
         """
@@ -622,50 +765,81 @@ class DrivenBrowser:
         logger.info("MITM proxy stopped")
 
     async def broken_browser(self, current_id: int) -> None:
-        traceback.print_stack()
+        # Only the first caller with the current id rebuilds.
         if current_id != self.current_id:
             logger.debug('Not matched')
             return
+
+        logger.warning("Rebuilding the browser for session %s", self.session)
+
         cookies: Optional[list[dict[str, str]]] = None
-        try:
-            cookies = await (await self.get_browser()).get_cookies()
-            logger.debug(cookies)
-        except Exception:
-            logger.warning('Dead browser')
+        # Read only an existing context; get_browser() would create one.
+        if self.context is not None:
+            try:
+                cookies = await self.context.get_cookies()
+                logger.debug(cookies)
+            except Exception as e:
+                logger.warning('Dead browser (%s: %s); rebuilding without its cookies',
+                               type(e).__name__, e)
 
         await self.destroy_driver(self.current_id)
         await self.close_proxy_handlers()
 
-        if cookies:
-            for cookie in cookies:
-                logger.debug(cookie)
-                await (await self.get_browser()).add_cookie(cookie)
+        if not cookies:
+            return
+
+        # Restore against one context; individual bad cookies must not abort.
+        try:
+            context = await self.get_browser()
+        except Exception as e:
+            logger.warning("Could not rebuild a context to restore cookies (%s: %s)",
+                           type(e).__name__, e)
+            return
+
+        restored = 0
+        for cookie in cookies:
+            try:
+                await context.add_cookie(cookie)
+                restored += 1
+            except Exception as e:
+                logger.debug("Could not restore cookie %s: %s",
+                             cookie.get("name", "?"), e)
+        logger.info("Restored %d/%d cookies for %s", restored, len(cookies), self.session)
 
     async def destroy_driver(self, current_id: int) -> None:
         if current_id != self.current_id:
             logger.debug('Not matched')
             return
-        if self.current_id > 0:
-            self.current_id = random.randint(0, 1000)
+        # Rotate before awaiting so concurrent callers fall out above.
+        # Always move to a positive id; 0 used to stay fixed.
+        if self.current_id >= 0:
+            new_id = random.randint(1, 1000)
+            while new_id == self.current_id:
+                new_id = random.randint(1, 1000)
+            self.current_id = new_id
         if not self.context:
-            return 
+            return
 
-        try:
-            await self.clear_downloads(delete_folder=True)
-        except Exception as e:
-            logger.warning("Unable to clear downloads.", exc_info=e)
+        async with self._context_lock:
+            if not self.context:
+                return
 
-        try:
-            context_id = self.context.context_id
-            await self.context.execute_cdp_cmd("Target.disposeBrowserContext",
-                                                        {"browserContextId": context_id})
-            # await context.quit() # ? Raises CDP exception Not Allowed
-        except Exception as e:
-            logger.warning("Quit context returned an error: %s", str(e))
+            try:
+                await self.clear_downloads(delete_folder=True)
+            except Exception as e:
+                logger.warning("Unable to clear downloads.", exc_info=e)
 
-        logger.debug("Stopped: %s", str(self.context))
-        self.context = None
-        self.sessiontabs.clear()
+            try:
+                context_id = self.context.context_id
+                await self.context.execute_cdp_cmd("Target.disposeBrowserContext",
+                                                            {"browserContextId": context_id})
+                # await context.quit() # ? Raises CDP exception Not Allowed
+            except Exception as e:
+                logger.warning("Quit context returned an error: %s", str(e))
+
+            logger.debug("Stopped: %s", str(self.context))
+            self.context = None
+            self.sessiontabs.clear()
 
     async def clear_downloads(self, delete_folder: bool = False) -> None:
         if os.path.exists(self.downloads_dir) and os.path.isdir(self.downloads_dir):
@@ -707,6 +881,8 @@ class BrowserController:
     def __init__(self, config: Init) -> None:
         self.config = config
         self.main_driver: webdriver.Chrome
+        # Guards destroy/initialize of the one shared main driver.
+        self._main_driver_lock: asyncio.Lock = asyncio.Lock()
 
     @staticmethod
     def get_certificate_spki_hash(cert_path: str) -> str:
@@ -741,7 +917,14 @@ class BrowserController:
         _options.add_argument("--disable-notifications")
         _options.add_argument("--disable-infobars")
         _options.add_argument("--disable-blink-features=AutomationControlled")
-        _options.add_argument("--disable-features=DisableLoadExtensionCommandLineSwitch")
+        # Chromium keeps only the last --disable-features, so use one list.
+        _options.add_argument(
+            "--disable-features=DisableLoadExtensionCommandLineSwitch,"
+            "WebRtcHideLocalIpsWithMdns")
+
+        # Keep WebRTC and HTTP/3 off transports the tunnel does not carry.
+        _options.add_argument("--webrtc-ip-handling-policy=disable_non_proxied_udp")
+        _options.add_argument("--disable-quic")
         _options.add_argument("--enable-features=RemoveClientHints,ReduceUserAgentDataLinuxPlatformVersion")
         _options.add_argument("--disk-cache-size=1")
         _options.add_argument("--media-cache-size=1")
@@ -783,10 +966,17 @@ class BrowserController:
             logger.warning("Driver quit returned an error: [%s]", str(e))
 
     async def check_main_driver(self) -> None:
-        try:
-            _ = await self.main_driver.execute_cdp_cmd('Target.getTargetInfo', {"targetId": self.targetId_main_driver})
-        except Exception as e:
-            logger.debug(e)
+        """Rebuild the shared driver if its CDP socket is gone."""
+        async with self._main_driver_lock:
+            try:
+                _ = await self.main_driver.execute_cdp_cmd(
+                    'Target.getTargetInfo',
+                    {"targetId": self.targetId_main_driver})
+                return
+            except Exception as e:
+                logger.debug(e)
+
+            logger.warning("Main driver is not responding; rebuilding")
             await self.destroy_main_driver()
             await self.initialize_main_driver()
 
@@ -841,6 +1031,14 @@ class SessionManager:
                 raise RuntimeError("Browser is shutting down.")
             return self.sessions[session]
 
+        # Serialise creation so concurrent first requests share one context.
+        async with self.browser_lock:
+            if session in self.sessions:
+                logger.debug("Session %s created while waiting", session)
+                return self.sessions[session]
+            return await self._create_session(session)
+
+    async def _create_session(self, session: str) -> Session:
         logger.debug("New session %s", session)
 
         socks_pool = SocksProxySession(socks_pool=SocksProxyPool(self.config.socks5_file), session=session)
@@ -877,7 +1075,8 @@ class SessionManager:
                 logger.debug(f"Checking {sess.in_use}")
 
                 idle = time.time() - sess.last_used
-                if not sess.in_use and idle >= timeout:
+                # A negative counter must still allow reaping.
+                if sess.in_use <= 0 and idle >= timeout:
                     break
 
                 await asyncio.sleep(max(timeout - idle, 2.0))
